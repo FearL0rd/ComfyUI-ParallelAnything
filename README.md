@@ -2,6 +2,8 @@
 
 This suite of nodes unlocks high-performance parallel processing in ComfyUI by utilizing **Model Replication**. Unlike standard offloading which moves a single model instance between devices, these nodes create independent replicas of the model on each selected GPU/CPU, allowing for true simultaneous batch processing.
 
+* **Tested on Z_IMAGE**
+
 ---
 
 ## 🚀 Key Features

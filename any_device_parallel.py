@@ -8,7 +8,7 @@ import gc
 import weakref
 from types import SimpleNamespace
 from dataclasses import dataclass, fields, is_dataclass
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 import comfy.model_management
 
 def check_sm80_support(device_name):
@@ -72,10 +72,12 @@ def clear_flux_caches(model):
         'pos_emb', '_pos_emb', 'pos_embed', '_pos_embed', 'cached_pos_emb',
         'rope', '_rope', 'freqs_cis', '_freqs_cis', 'freqs', '_freqs',
         'cache', '_cache', 'kv_cache', '_kv_cache', 'attn_bias', '_attn_bias',
+        'rope_cache', '_rope_cache', 'freqs_cis_cache', '_freqs_cis_cache',
         # LTX/Video specific
         'temporal_ids', 'frame_ids', 'video_ids', 'temp_pos_emb',
     ]
     cleared = []
+    
     for name, module in model.named_modules():
         for attr in cache_attrs:
             if hasattr(module, attr):
@@ -86,6 +88,7 @@ def clear_flux_caches(model):
                         cleared.append(f"{name}.{attr}" if name else attr)
                 except Exception:
                     pass
+    
     for attr in cache_attrs:
         if hasattr(model, attr):
             try:
@@ -95,13 +98,20 @@ def clear_flux_caches(model):
                     cleared.append(attr)
             except Exception:
                 pass
+    
     if cleared:
         print(f"[ParallelAnything] Cleared {len(cleared)} cached tensors")
 
-def cleanup_parallel_model(model):
+def cleanup_parallel_model(model_ref):
     """Cleanup function to remove parallel replicas and restore original model."""
+    # FIX: Handle weakref properly
+    model = model_ref() if isinstance(model_ref, weakref.ref) else model_ref
+    if model is None:
+        return
+    
     if not hasattr(model, '_true_parallel_active'):
         return
+    
     print("[ParallelAnything] Cleaning up parallel model...")
     
     if hasattr(model, '_original_forward'):
@@ -118,6 +128,9 @@ def cleanup_parallel_model(model):
                 replica.cpu()
                 for name, module in replica.named_modules():
                     clear_flux_caches(module)
+                # FIX: Disable gradient checkpointing cleanup
+                if hasattr(replica, 'gradient_checkpointing'):
+                    replica.gradient_checkpointing = False
             except:
                 pass
         try:
@@ -125,7 +138,7 @@ def cleanup_parallel_model(model):
         except:
             pass
     
-    for attr in ['_true_parallel_active', '_parallel_devices', 'forward_orig_backup']:
+    for attr in ['_true_parallel_active', '_parallel_devices', 'forward_orig_backup', '_parallel_streams']:
         if hasattr(model, attr):
             try:
                 delattr(model, attr)
@@ -143,13 +156,11 @@ def extract_model_config(model):
     possible_attrs = [
         'in_channels', 'out_channels', 'vec_in_dim', 'context_in_dim', 'hidden_size',
         'mlp_ratio', 'num_heads', 'depth', 'depth_single_blocks', 'depth_single',
-        'axes_dim', 'theta', 'patch_size', 'qkv_bias', 'guidance_embed',
-        'txt_ids_dim', 'img_ids_dim', 'num_res_blocks', 'attention_resolutions',
-        'dropout', 'channel_mult', 'num_classes', 'use_checkpoint', 'num_heads_upsample',
-        'use_scale_shift_norm', 'resblock_updown', 'use_new_attention_order',
-        'adm_in_channels', 'num_noises', 'context_dim', 'n_heads', 'd_head',
-        'transformer_depth', 'model_channels', 'max_depth',
-        # Video specific
+        'axes_dim', 'theta', 'patch_size', 'qkv_bias', 'guidance_embed', 'txt_ids_dim',
+        'img_ids_dim', 'num_res_blocks', 'attention_resolutions', 'dropout', 'channel_mult',
+        'num_classes', 'use_checkpoint', 'num_heads_upsample', 'use_scale_shift_norm',
+        'resblock_updown', 'use_new_attention_order', 'adm_in_channels', 'num_noises',
+        'context_dim', 'n_heads', 'd_head', 'transformer_depth', 'model_channels', 'max_depth',
         'num_frames', 'temporal_compression', 'temporal_dim', 'video_length',
     ]
     
@@ -241,18 +252,22 @@ def clone_module_simple(module, target_device):
     """Simple module cloning that handles Parameters and FLUX-specific attributes."""
     if module is None:
         return None
+    
     module_class = module.__class__
     
+    # FIX: Cleaner attribute handling for Conv/Linear layers
     if isinstance(module, (nn.Linear, nn.Conv2d, nn.Conv1d)):
         try:
-            in_channels = safe_getattr(module, 'in_features') or safe_getattr(module, 'in_channels', 0)
-            out_channels = safe_getattr(module, 'out_features') or safe_getattr(module, 'out_channels', 0)
-            has_bias = safe_getattr(module, 'bias') is not None
             weight_dtype = safe_getattr(safe_getattr(module, 'weight'), 'dtype', torch.float32)
+            has_bias = safe_getattr(module, 'bias') is not None
             
             if isinstance(module, nn.Linear):
-                new_mod = nn.Linear(in_channels, out_channels, bias=has_bias, device=target_device, dtype=weight_dtype)
+                in_features = safe_getattr(module, 'in_features')
+                out_features = safe_getattr(module, 'out_features')
+                new_mod = nn.Linear(in_features, out_features, bias=has_bias, device=target_device, dtype=weight_dtype)
             elif isinstance(module, nn.Conv2d):
+                in_channels = safe_getattr(module, 'in_channels')
+                out_channels = safe_getattr(module, 'out_channels')
                 kernel_size = safe_getattr(module, 'kernel_size', 1)
                 stride = safe_getattr(module, 'stride', 1)
                 padding = safe_getattr(module, 'padding', 0)
@@ -263,6 +278,8 @@ def clone_module_simple(module, target_device):
                                    dilation=dilation, groups=groups, bias=has_bias, padding_mode=padding_mode, 
                                    device=target_device, dtype=weight_dtype)
             elif isinstance(module, nn.Conv1d):
+                in_channels = safe_getattr(module, 'in_channels')
+                out_channels = safe_getattr(module, 'out_channels')
                 kernel_size = safe_getattr(module, 'kernel_size', 1)
                 stride = safe_getattr(module, 'stride', 1)
                 padding = safe_getattr(module, 'padding', 0)
@@ -284,26 +301,29 @@ def clone_module_simple(module, target_device):
     
     if isinstance(module, (nn.LayerNorm, nn.BatchNorm2d, nn.GroupNorm)):
         try:
-            normalized_shape = safe_getattr(module, 'normalized_shape')
-            num_features = safe_getattr(module, 'num_features', 0)
-            num_groups = safe_getattr(module, 'num_groups', 1)
-            num_channels = safe_getattr(module, 'num_channels', 0)
-            eps = safe_getattr(module, 'eps', 1e-5)
-            elementwise_affine = safe_getattr(module, 'elementwise_affine', True)
-            momentum = safe_getattr(module, 'momentum', 0.1)
-            affine = safe_getattr(module, 'affine', True)
-            track_running_stats = safe_getattr(module, 'track_running_stats', True)
             weight_dtype = safe_getattr(safe_getattr(module, 'weight'), 'dtype', torch.float32)
             if weight_dtype is None:
                 weight_dtype = torch.float32
             
             if isinstance(module, nn.LayerNorm):
+                normalized_shape = safe_getattr(module, 'normalized_shape')
+                eps = safe_getattr(module, 'eps', 1e-5)
+                elementwise_affine = safe_getattr(module, 'elementwise_affine', True)
                 new_mod = nn.LayerNorm(normalized_shape, eps=eps, elementwise_affine=elementwise_affine, 
                                       device=target_device, dtype=weight_dtype)
             elif isinstance(module, nn.BatchNorm2d):
+                num_features = safe_getattr(module, 'num_features')
+                eps = safe_getattr(module, 'eps', 1e-5)
+                momentum = safe_getattr(module, 'momentum', 0.1)
+                affine = safe_getattr(module, 'affine', True)
+                track_running_stats = safe_getattr(module, 'track_running_stats', True)
                 new_mod = nn.BatchNorm2d(num_features, eps=eps, momentum=momentum, affine=affine, 
                                         track_running_stats=track_running_stats, device=target_device, dtype=weight_dtype)
             elif isinstance(module, nn.GroupNorm):
+                num_groups = safe_getattr(module, 'num_groups')
+                num_channels = safe_getattr(module, 'num_channels')
+                eps = safe_getattr(module, 'eps', 1e-5)
+                affine = safe_getattr(module, 'affine', True)
                 new_mod = nn.GroupNorm(num_groups, num_channels, eps=eps, affine=affine, 
                                       device=target_device, dtype=weight_dtype)
             
@@ -345,8 +365,9 @@ def clone_module_simple(module, target_device):
         
         cache_attrs = {
             'img_ids', 'txt_ids', '_img_ids', '_txt_ids', 'cached_img_ids', 'cached_txt_ids',
-            'pos_emb', '_pos_emb', 'pos_embed', '_pos_embed', 'freqs_cis', '_freqs_cis', 
+            'pos_emb', '_pos_emb', 'pos_embed', '_pos_embed', 'freqs_cis', '_freqs_cis',
             'freqs', '_freqs', 'cache', '_cache', 'kv_cache', '_kv_cache', 'attn_bias', '_attn_bias',
+            'rope_cache', '_rope_cache', 'freqs_cis_cache', '_freqs_cis_cache'
         }
         
         for key, value in module.__dict__.items():
@@ -374,6 +395,7 @@ def clone_module_simple(module, target_device):
                             setattr(new_mod, key, copy.deepcopy(value))
                 except Exception:
                     pass
+        
         new_mod = new_mod.to(target_device)
         return new_mod
     except Exception as e:
@@ -382,7 +404,9 @@ def clone_module_simple(module, target_device):
 def safe_model_clone(source_model, target_device, disable_flash=False):
     """FLUX-safe model cloning with explicit memory cleanup."""
     clear_flux_caches(source_model)
+    
     src_device = next(source_model.parameters()).device if next(source_model.parameters(), None) is not None else torch.device('cpu')
+    
     if src_device.type != 'cpu':
         model_cpu = source_model.cpu()
     else:
@@ -393,6 +417,7 @@ def safe_model_clone(source_model, target_device, disable_flash=False):
         comfy.model_management.soft_empty_cache()
     
     model_class = model_cpu.__class__
+    
     try:
         replica = copy.deepcopy(model_cpu)
         replica = replica.to(target_device)
@@ -402,11 +427,13 @@ def safe_model_clone(source_model, target_device, disable_flash=False):
             print(f"[ParallelAnything] Deepcopy failed ({str(e)[:80]}), trying config reconstruction...")
         else:
             raise e
+        
         try:
             config = extract_model_config(model_cpu)
             state_dict = model_cpu.state_dict()
             if not config:
                 raise RuntimeError("Could not extract model config")
+            
             try:
                 replica = model_class(**config)
             except TypeError as e:
@@ -418,6 +445,7 @@ def safe_model_clone(source_model, target_device, disable_flash=False):
                         replica = model_class(config_obj)
                 else:
                     raise e
+            
             replica.load_state_dict(state_dict, strict=False)
             replica = replica.to(target_device)
             method_used = "config_reconstruction"
@@ -433,17 +461,78 @@ def safe_model_clone(source_model, target_device, disable_flash=False):
     del model_cpu
     gc.collect()
     clear_flux_caches(replica)
+    
+    # FIX: Disable gradient checkpointing to save VRAM
+    if hasattr(replica, 'gradient_checkpointing'):
+        replica.gradient_checkpointing = False
+    if hasattr(replica, '_gradient_checkpointing_func'):
+        replica._gradient_checkpointing_func = None
+    
+    # FIX: Handle accelerate hooks/offloading
+    if hasattr(replica, 'hooks'):
+        replica.hooks = []
+    if hasattr(replica, '_hf_hook'):
+        replica._hf_hook = None
+    
     replica.eval()
     for param in replica.parameters():
         param.requires_grad = False
+    
     for buffer in replica.buffers():
         if buffer.device != target_device:
             buffer.data = buffer.data.to(target_device)
     
     if disable_flash:
         disable_flash_xformers(replica)
+    
     print(f"[ParallelAnything] Cloned via {method_used} to {target_device}")
     return replica
+
+def get_free_vram(device_name):
+    """Get available VRAM in MB for a device."""
+    try:
+        if device_name.startswith("cuda"):
+            idx = int(device_name.split(":")[-1])
+            torch.cuda.set_device(idx)
+            free_memory = torch.cuda.get_device_properties(idx).total_memory - torch.cuda.memory_allocated(idx)
+            return free_memory / (1024 ** 2)  # Convert to MB
+    except:
+        pass
+    return 0
+
+def auto_split_batch(batch_size, devices, weights):
+    """Adjust split based on available VRAM."""
+    if not any(d.startswith("cuda") for d in devices):
+        return [max(1, int(batch_size * w)) for w in weights]
+    
+    vram_avail = []
+    for d in devices:
+        if d.startswith("cuda"):
+            vram_avail.append(get_free_vram(d))
+        else:
+            vram_avail.append(0)  # CPU gets 0 weight in VRAM calculation
+    
+    total_vram = sum(vram_avail)
+    if total_vram == 0:
+        return [max(1, int(batch_size * w)) for w in weights]
+    
+    # Mix percentage weights with VRAM availability (70% user pref, 30% VRAM)
+    adjusted_weights = []
+    for i, (w, vram) in enumerate(zip(weights, vram_avail)):
+        if vram > 0:
+            vram_weight = vram / total_vram
+            adjusted = 0.7 * w + 0.3 * vram_weight
+        else:
+            adjusted = w
+        adjusted_weights.append(adjusted)
+    
+    # Normalize
+    total = sum(adjusted_weights)
+    adjusted_weights = [w/total for w in adjusted_weights]
+    
+    split_sizes = [max(1, int(batch_size * w)) for w in adjusted_weights]
+    split_sizes[-1] = batch_size - sum(split_sizes[:-1])  # Adjust last to ensure sum = batch_size
+    return split_sizes
 
 class ParallelDevice:
     @classmethod
@@ -467,7 +556,7 @@ class ParallelDevice:
         except ImportError:
             pass
         return devices
-    
+
     @classmethod
     def INPUT_TYPES(s):
         available = s.get_available_devices()
@@ -492,21 +581,23 @@ class ParallelDevice:
                 }),
             }
         }
-    
+
     RETURN_TYPES = ("DEVICE_CHAIN",)
     RETURN_NAMES = ("device_chain",)
     FUNCTION = "add_device"
     CATEGORY = "utils/hardware"
     DESCRIPTION = "Add a GPU/CPU/MPS/XPU device to the parallel processing chain"
-    
+
     def add_device(self, device_id, percentage, previous_devices=None):
         if previous_devices is None:
             previous_devices = []
+        
         config = {
             "device": device_id,
             "percentage": float(percentage),
             "weight": float(percentage) / 100.0
         }
+        
         new_chain = previous_devices.copy()
         new_chain.append(config)
         return (new_chain,)
@@ -524,7 +615,7 @@ class ParallelDeviceList:
             for i in range(torch.xpu.device_count()):
                 devices.append(f"xpu:{i}")
         return devices
-    
+
     @classmethod
     def INPUT_TYPES(s):
         devices = s.get_available_devices()
@@ -543,15 +634,16 @@ class ParallelDeviceList:
                 "pct_4": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 1.0}),
             }
         }
-    
+
     RETURN_TYPES = ("DEVICE_CHAIN",)
     RETURN_NAMES = ("device_chain",)
     FUNCTION = "create_list"
     CATEGORY = "utils/hardware"
-    
+
     def create_list(self, device_1, pct_1, device_2, pct_2, device_3="cpu", pct_3=0, device_4="cpu", pct_4=0):
         chain = []
         devices = [(device_1, pct_1), (device_2, pct_2), (device_3, pct_3), (device_4, pct_4)]
+        
         for dev_str, pct in devices:
             if pct > 0:
                 chain.append({
@@ -574,15 +666,19 @@ class ParallelAnything:
                     "default": True,
                     "tooltip": "Enable multi-device processing"
                 }),
+                "auto_vram_balance": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Automatically adjust batch split based on available VRAM"
+                }),
             }
         }
-    
+
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "setup_parallel"
     CATEGORY = "utils/hardware"
-    
-    def setup_parallel(self, model, device_chain, workload_split=True):
+
+    def setup_parallel(self, model, device_chain, workload_split=True, auto_vram_balance=False):
         if model is None or not device_chain:
             return (model,)
         
@@ -596,7 +692,7 @@ class ParallelAnything:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-                comfy.model_management.soft_empty_cache()
+            comfy.model_management.soft_empty_cache()
         
         total_pct = sum(item["percentage"] for item in device_chain)
         if total_pct <= 0:
@@ -609,6 +705,7 @@ class ParallelAnything:
             device_names.append(item["device"])
         
         print(f"[ParallelAnything] Setup: {list(zip(device_names, [f'{w*100:.1f}%' for w in weights]))}")
+        
         lead_device = torch.device(device_names[0])
         
         devices_needing_safe_attention = {}
@@ -630,9 +727,12 @@ class ParallelAnything:
             original_device = torch.device('cpu')
         
         replicas = {}
+        streams = {}  # IMPROVEMENT: CUDA streams for parallel execution
+        
         try:
             print(f"[ParallelAnything] Cloning to {len(device_names)} devices... (safe mode)")
             clear_flux_caches(target_model)
+            
             if original_device.type == 'cuda':
                 print(f"[ParallelAnything] Moving model to CPU for safe cloning...")
                 target_model = target_model.cpu()
@@ -642,14 +742,24 @@ class ParallelAnything:
             for dev_name in device_names:
                 dev = torch.device(dev_name)
                 need_safe = dev_name in devices_needing_safe_attention
+                
                 try:
                     replica = safe_model_clone(target_model, dev, disable_flash=need_safe)
                     clear_flux_caches(replica)
                     replicas[dev_name] = replica
+                    
+                    # IMPROVEMENT: Create CUDA stream for this device
+                    if dev.type == 'cuda':
+                        streams[dev_name] = torch.cuda.Stream(dev)
+                    else:
+                        streams[dev_name] = None
+                    
                     print(f"[ParallelAnything] ✓ {dev_name}" + (" (Safe mode)" if need_safe else ""))
+                    
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                         comfy.model_management.soft_empty_cache()
+                        
                 except Exception as e:
                     print(f"[ParallelAnything] Error cloning to {dev_name}: {e}")
                     import traceback
@@ -676,23 +786,28 @@ class ParallelAnything:
         devices_ref = device_names
         weights_ref = weights
         lead_ref = lead_device
+        streams_ref = streams
+        auto_balance_ref = auto_vram_balance
         
-        # VIDEO FIX: Helper functions for tensor handling
+        # FIX: Improved batch size detection with validation
         def get_batch_size(x):
-            """VIDEO FIX: Handle both tensor and list inputs."""
+            """Handle both tensor and list inputs with validation."""
             if isinstance(x, torch.Tensor):
                 return x.shape[0]
             elif isinstance(x, (list, tuple)) and len(x) > 0:
-                # Assume list of tensors, get batch from first element
                 if isinstance(x[0], torch.Tensor):
-                    return x[0].shape[0]
-                else:
-                    return len(x)
+                    batch_sizes = [t.shape[0] for t in x if isinstance(t, torch.Tensor)]
+                    if batch_sizes:
+                        # Validate all tensors have same batch size
+                        if not all(b == batch_sizes[0] for b in batch_sizes):
+                            raise ValueError(f"Inconsistent batch sizes in input list: {batch_sizes}")
+                        return batch_sizes[0]
+                return len(x)
             else:
                 return 1
         
         def split_batch(x, split_sizes):
-            """VIDEO FIX: Split tensors or lists of tensors."""
+            """Split tensors or lists of tensors."""
             if isinstance(x, torch.Tensor):
                 return torch.split(x, split_sizes, dim=0)
             elif isinstance(x, (list, tuple)):
@@ -705,7 +820,7 @@ class ParallelAnything:
                 return [x] * len(split_sizes)
         
         def move_to_device(x, device, non_blocking=True):
-            """VIDEO FIX: Move tensor or list/tuple of tensors to device."""
+            """Move tensor or list/tuple of tensors to device."""
             if isinstance(x, torch.Tensor):
                 return x.to(device, non_blocking=non_blocking)
             elif isinstance(x, (list, tuple)):
@@ -714,8 +829,9 @@ class ParallelAnything:
             else:
                 return x
         
-        def split_kwargs(kwargs, split_sizes, device):
-            """VIDEO FIX: Handle list-of-tensors in kwargs (common in video models)."""
+        # FIX: Don't pre-move tensors in split_kwargs (avoid double transfer)
+        def split_kwargs(kwargs, split_sizes):
+            """Handle list-of-tensors in kwargs (common in video models)."""
             split_kwargs_list = [{} for _ in range(len(split_sizes))]
             total_batch = sum(split_sizes)
             
@@ -723,10 +839,9 @@ class ParallelAnything:
                 if isinstance(value, torch.Tensor) and value.shape[0] == total_batch:
                     chunks = torch.split(value, split_sizes, dim=0)
                     for i, chunk in enumerate(chunks):
-                        split_kwargs_list[i][key] = chunk.to(device)
+                        split_kwargs_list[i][key] = chunk  # Don't move to device yet
                 elif isinstance(value, (list, tuple)) and len(value) > 0 and isinstance(value[0], torch.Tensor):
                     # Handle list of tensors (e.g., frame conditioning)
-                    # Check if all have batch dim
                     if all(isinstance(t, torch.Tensor) and t.shape[0] == total_batch for t in value):
                         split_lists = [torch.split(t, split_sizes, dim=0) for t in value]
                         for i in range(len(split_sizes)):
@@ -741,9 +856,10 @@ class ParallelAnything:
             return split_kwargs_list
         
         def concatenate_results(results, dim=0):
-            """VIDEO FIX: Concatenate tensor or list/tuple of tensors."""
+            """Concatenate tensor or list/tuple of tensors."""
             if len(results) == 0:
                 return results
+            
             first = results[0]
             if isinstance(first, torch.Tensor):
                 return torch.cat(results, dim=dim)
@@ -762,13 +878,24 @@ class ParallelAnything:
                 return results
         
         def parallel_forward(self, x, timesteps, context=None, **kwargs):
-            batch_size = get_batch_size(x)
+            # FIX: Validate batch size consistency
+            try:
+                batch_size = get_batch_size(x)
+            except ValueError as e:
+                print(f"[ParallelAnything] Error: {e}")
+                raise
+            
             if batch_size < len(devices_ref) or not workload_split:
                 with torch.no_grad():
                     out = replicas_ref[devices_ref[0]](x, timesteps, context=context, **kwargs)
-                    return out
+                return out
             
-            split_sizes = [max(1, int(batch_size * w)) for w in weights_ref]
+            # IMPROVEMENT: Use auto VRAM balancing if enabled
+            if auto_balance_ref:
+                split_sizes = auto_split_batch(batch_size, devices_ref, weights_ref)
+            else:
+                split_sizes = [max(1, int(batch_size * w)) for w in weights_ref]
+            
             split_sizes[-1] = batch_size - sum(split_sizes[:-1])
             
             active = []
@@ -779,6 +906,7 @@ class ParallelAnything:
                         'dev_name': dev_name,
                         'device': torch.device(dev_name),
                         'replica': replicas_ref[dev_name],
+                        'stream': streams_ref.get(dev_name),
                         'size': size,
                     })
             
@@ -786,7 +914,6 @@ class ParallelAnything:
                 with torch.no_grad():
                     return active[0]['replica'](x, timesteps, context=context, **kwargs)
             
-            # VIDEO FIX: Use robust splitting
             x_chunks = split_batch(x, [a['size'] for a in active])
             t_chunks = split_batch(timesteps, [a['size'] for a in active])
             
@@ -795,14 +922,21 @@ class ParallelAnything:
             else:
                 c_chunks = [None] * len(active)
             
-            kwargs_chunks = split_kwargs(kwargs, [a['size'] for a in active], lead_ref)
-            results = [None] * len(active)
+            # FIX: Don't pre-move kwargs to device
+            kwargs_chunks = split_kwargs(kwargs, [a['size'] for a in active])
             
+            results = [None] * len(active)
+            exceptions = []
+            
+            # FIX: Improved error handling with proper cleanup
             def worker(task_idx):
                 task = active[task_idx]
                 dev = task['device']
                 replica = task['replica']
+                stream = task['stream']
+                
                 try:
+                    # Move inputs to device (now happens here, not in split_kwargs)
                     x_in = move_to_device(x_chunks[task_idx], dev)
                     t_in = move_to_device(t_chunks[task_idx], dev)
                     c_in = move_to_device(c_chunks[task_idx], dev) if c_chunks[task_idx] is not None else None
@@ -812,7 +946,15 @@ class ParallelAnything:
                     for k, v in kwargs_chunks[task_idx].items():
                         k_in[k] = move_to_device(v, dev, non_blocking=False)
                     
-                    if dev.type == 'cuda':
+                    # IMPROVEMENT: Use CUDA streams for parallel execution
+                    if dev.type == 'cuda' and stream is not None:
+                        with torch.cuda.device(dev):
+                            with torch.cuda.stream(stream):
+                                torch.cuda.synchronize(dev)
+                                with torch.no_grad():
+                                    out = replica(x_in, t_in, context=c_in, **k_in)
+                                torch.cuda.synchronize(dev)
+                    elif dev.type == 'cuda':
                         with torch.cuda.device(dev):
                             torch.cuda.synchronize(dev)
                             with torch.no_grad():
@@ -828,21 +970,38 @@ class ParallelAnything:
                         with torch.no_grad():
                             out = replica(x_in, t_in, context=c_in, **k_in)
                     
-                    # VIDEO FIX: Move result back handling list/tuple
+                    # Move result back handling list/tuple
                     out = move_to_device(out, lead_ref, non_blocking=False)
                     return task_idx, out
+                    
                 except Exception as e:
+                    # FIX: Return exception instead of raising to allow cleanup
                     return task_idx, e
             
+            # FIX: Use context manager for proper thread cleanup
             with ThreadPoolExecutor(max_workers=len(active)) as executor:
                 futures = [executor.submit(worker, i) for i in range(len(active))]
+                
+                # FIX: Collect all results and check for exceptions
                 for future in as_completed(futures):
                     idx, result = future.result()
                     if isinstance(result, Exception):
-                        raise result
-                    results[idx] = result
+                        exceptions.append((active[idx]['dev_name'], result))
+                        results[idx] = None
+                    else:
+                        results[idx] = result
             
-            # VIDEO FIX: Robust concatenation
+            # FIX: Handle exceptions after all threads complete
+            if exceptions:
+                for dev_name, exc in exceptions:
+                    print(f"[ParallelAnything] Error on {dev_name}: {exc}")
+                raise exceptions[0][1]  # Raise first exception
+            
+            # Verify all results present
+            if any(r is None for r in results):
+                missing = [active[i]['dev_name'] for i, r in enumerate(results) if r is None]
+                raise RuntimeError(f"Missing results from devices: {missing}")
+            
             return concatenate_results(results, dim=0)
         
         target_model._original_forward = target_model.forward
@@ -850,8 +1009,11 @@ class ParallelAnything:
         target_model._true_parallel_active = True
         target_model._parallel_replicas = replicas
         target_model._parallel_devices = device_names
+        target_model._parallel_streams = streams  # Store for cleanup
         
-        weakref.finalize(model, cleanup_parallel_model, target_model)
+        # FIX: Use weakref properly to avoid strong reference
+        weakref.finalize(model, cleanup_parallel_model, weakref.ref(target_model))
+        
         model.load_device = lead_device
         return (model,)
 

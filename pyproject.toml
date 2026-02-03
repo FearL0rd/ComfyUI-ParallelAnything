@@ -2,7 +2,7 @@
 [project]
 name = "ComfyUI-ParallelAnything" # Unique identifier for your node. Immutable after creation.
 description = "This suite of nodes unlocks high-performance parallel processing in ComfyUI by utilizing **Model Replication**. Unlike standard offloading which moves a single model instance between devices, these nodes create independent replicas of the model on each selected GPU/CPU, allowing for true simultaneous batch processing."
-version = "1.0.1" # Custom Node version. Must be semantically versioned.
+version = "1.0.2" # Custom Node version. Must be semantically versioned.
 license = { file = "LICENSE.txt" }
 dependencies  = [] # Filled in from requirements.txt
 
@@ -14,3 +14,4 @@ PublisherId = "fearl0rd" # TODO (fill in Publisher ID from Comfy Registry Websit
 DisplayName = "ComfyUI-ParallelAnything" # Display name for the Custom Node. Can be changed later.
 
 Icon = "https://raw.githubusercontent.com/FearL0rd/ComfyUI-ParallelAnything/refs/heads/main/icon.png" # SVG, PNG, JPG or GIF (MAX. 800x400px)
+

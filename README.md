@@ -21,16 +21,17 @@ This suite of nodes unlocks high-performance parallel processing in ComfyUI by u
 ### 1. Parallel Anything (True Multi-GPU)
 The main orchestration node. It intercepts the diffusion model's forward pass and triggers simultaneous compute kernels across all available replicas.
 
-<img width="480" height="263" alt="image" src="https://github.com/user-attachments/assets/949d07b6-d2b6-40e4-8bc9-3b5be43749db" />
+<img width="346" height="222" alt="image" src="https://github.com/user-attachments/assets/73096237-fbf7-4116-8187-ed83f07bf94c" />
+
 
 ### 2. Parallel Device Config / List
 Allows you to build a `DEVICE_CHAIN`. You can chain multiple GPUs together or use the List node to quickly and their respective workload percentages.
 
 - Option 1
-<img width="1688" height="222" alt="image" src="https://github.com/user-attachments/assets/4dae2fa2-abca-47a1-b7a0-515346b45b66" />
+<img width="1397" height="249" alt="image" src="https://github.com/user-attachments/assets/b587b2f3-ef41-4623-a783-4bb2a55dcf31" />
 
 - Option 2
-<img width="907" height="361" alt="image" src="https://github.com/user-attachments/assets/339057c9-6b6b-4828-b6fb-63cc2c2fdbc0" />
+<img width="723" height="315" alt="image" src="https://github.com/user-attachments/assets/9773e615-d1a2-43e5-a1d0-2d00367e78ac" />
 
 - Console
 <img width="1072" height="117" alt="image" src="https://github.com/user-attachments/assets/e928ebdb-496d-43a3-9d8e-ab79e03f1a63" />

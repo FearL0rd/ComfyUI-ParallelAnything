@@ -42,6 +42,15 @@ Allows you to build a `DEVICE_CHAIN`. You can chain multiple GPUs together or us
 
 <img width="2054" height="867" alt="image" src="https://github.com/user-attachments/assets/52c1da42-07e3-4cda-8545-96b953a91266" />
 
+- Test Case with batch_Size = 21
+  - Single 3090 (26.00s/it)
+
+    <img width="1532" height="55" alt="image" src="https://github.com/user-attachments/assets/5cbc348d-fb79-4ea8-b8b5-844ccf2fdb5b" />
+    
+  - V100 + 3090 (17.51s/it) (My old PC with GEN1@4x PCIe (3090) + GEN3@16x PCIe (V100))
+
+    <img width="1524" height="52" alt="image" src="https://github.com/user-attachments/assets/7bdaaa3d-973f-4fb5-911f-06ba3b660cab" />
+
 ---
 
 ## Requirements

@@ -9,6 +9,13 @@ from dataclasses import dataclass, fields, is_dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import comfy.model_management
 
+def is_float8_dtype(dtype):
+    """Check if dtype is any FP8 variant (E4M3, E5M2, etc.)."""
+    if dtype is None:
+        return False
+    dtype_name = str(dtype)
+    fp8_types = ['float8_e4m3fn', 'float8_e5m2', 'float8_e4m3fnuz', 'float8_e5m2fnuz', 'float8']
+    return any(t in dtype_name for t in fp8_types)
 
 def check_sm80_support(device_name):
     """Check if CUDA device supports SM_80 (Ampere) or higher."""
@@ -23,6 +30,21 @@ def check_sm80_support(device_name):
         print(f"[ParallelAnything] Warning: Could not check compute capability for {device_name}: {e}")
         return False
 
+def device_supports_float8(device):
+    """Check if CUDA device supports Float8 computation (SM90+ / Hopper/Ada)."""
+    if isinstance(device, str):
+        if not device.startswith("cuda"):
+            return False
+        device = torch.device(device)
+    if device.type != 'cuda':
+        return False
+    try:
+        cap = torch.cuda.get_device_capability(device)
+        major, minor = cap
+        # FP8 computation requires Hopper/Ada (SM9.0+) or newer
+        return (major, minor) >= (9, 0)
+    except:
+        return False
 
 def disable_flash_xformers(model):
     """Aggressively disable Flash Attention and xFormers on the model."""
@@ -69,7 +91,6 @@ def disable_flash_xformers(model):
                 except Exception:
                     pass
 
-
 def clear_flux_caches(model):
     """Clear FLUX-specific cached tensors that depend on batch size or input dimensions."""
     cache_attrs = [
@@ -80,6 +101,7 @@ def clear_flux_caches(model):
         'rope_cache', '_rope_cache', 'freqs_cis_cache', '_freqs_cis_cache',
         'temporal_ids', 'frame_ids', 'video_ids', 'temp_pos_emb',
     ]
+    
     cleared_count = 0
     
     def clear_attrs(obj, name_prefix=""):
@@ -103,7 +125,6 @@ def clear_flux_caches(model):
     if cleared_count > 0:
         print(f"[ParallelAnything] Cleared {cleared_count} cached tensors")
 
-
 def aggressive_cleanup():
     """Force aggressive CUDA memory cleanup."""
     gc.collect()
@@ -119,7 +140,6 @@ def aggressive_cleanup():
             except:
                 pass
     comfy.model_management.soft_empty_cache()
-
 
 def cleanup_parallel_model(model_ref):
     """Cleanup function to remove parallel replicas and restore original model."""
@@ -161,6 +181,7 @@ def cleanup_parallel_model(model_ref):
                     replica._gradient_checkpointing_func = None
             except Exception as e:
                 print(f"[ParallelAnything] Warning: Error cleaning up replica on {dev_name}: {e}")
+        
         try:
             delattr(model, '_parallel_replicas')
         except Exception:
@@ -203,20 +224,20 @@ def cleanup_parallel_model(model_ref):
             except:
                 pass
 
-
 def extract_model_config(model):
     """Extract initialization config from model instance with FLUX-specific handling."""
     config = {}
+    
     possible_attrs = [
         'in_channels', 'out_channels', 'vec_in_dim', 'context_in_dim', 'hidden_size',
         'mlp_ratio', 'num_heads', 'depth', 'depth_single_blocks', 'depth_single',
         'axes_dim', 'theta', 'patch_size', 'qkv_bias', 'guidance_embed',
         'txt_ids_dim', 'img_ids_dim', 'num_res_blocks', 'attention_resolutions',
-        'dropout', 'channel_mult', 'num_classes', 'use_checkpoint', 'num_heads_upsample',
-        'use_scale_shift_norm', 'resblock_updown', 'use_new_attention_order',
-        'adm_in_channels', 'num_noises', 'context_dim', 'n_heads', 'd_head',
-        'transformer_depth', 'model_channels', 'max_depth', 'num_frames',
-        'temporal_compression', 'temporal_dim', 'video_length',
+        'dropout', 'channel_mult', 'num_classes', 'use_checkpoint',
+        'num_heads_upsample', 'use_scale_shift_norm', 'resblock_updown',
+        'use_new_attention_order', 'adm_in_channels', 'num_noises', 'context_dim',
+        'n_heads', 'd_head', 'transformer_depth', 'model_channels', 'max_depth',
+        'num_frames', 'temporal_compression', 'temporal_dim', 'video_length',
     ]
     
     for attr in possible_attrs:
@@ -246,7 +267,7 @@ def extract_model_config(model):
                 params_dict = vars(params)
                 if params_dict:
                     config.update({k: v for k, v in params_dict.items() 
-                                  if not isinstance(v, (torch.Tensor, nn.Module))})
+                                 if not isinstance(v, (torch.Tensor, nn.Module))})
         except Exception:
             pass
     
@@ -256,7 +277,7 @@ def extract_model_config(model):
             cfg = model.config
             if isinstance(cfg, dict):
                 config.update({k: v for k, v in cfg.items() 
-                              if not isinstance(v, (torch.Tensor, nn.Module))})
+                             if not isinstance(v, (torch.Tensor, nn.Module))})
             else:
                 cfg_dict = {k: v for k, v in vars(cfg).items() 
                            if not k.startswith('_') and not callable(v) 
@@ -280,7 +301,6 @@ def extract_model_config(model):
                 pass
     
     return clean_config
-
 
 def clone_dataclass_or_object(obj, target_device=None):
     """Deep copy a dataclass or simple object, handling nested structures."""
@@ -317,14 +337,12 @@ def clone_dataclass_or_object(obj, target_device=None):
     except Exception:
         return obj
 
-
 def safe_getattr(obj, attr, default=None):
     """Safely get attribute, returning default if not exists."""
     return getattr(obj, attr, default)
 
-
 def clone_module_simple(module, target_device):
-    """Simple module cloning that handles Parameters and FLUX-specific attributes."""
+    """Simple module cloning that handles Parameters and FLUX-specific attributes with FP8 support."""
     if module is None:
         return None
     
@@ -336,6 +354,11 @@ def clone_module_simple(module, target_device):
             weight = safe_getattr(module, 'weight', None)
             weight_dtype = weight.dtype if weight is not None else torch.float32
             has_bias = safe_getattr(module, 'bias', None) is not None
+            
+            # Check FP8 support for target device
+            supports_fp8 = device_supports_float8(target_device)
+            if not supports_fp8 and is_float8_dtype(weight_dtype):
+                weight_dtype = torch.float16
             
             if isinstance(module, nn.Linear):
                 in_features = safe_getattr(module, 'in_features')
@@ -371,6 +394,9 @@ def clone_module_simple(module, target_device):
             
             with torch.no_grad():
                 if weight is not None:
+                    # Convert FP8 to FP16 if needed
+                    if not supports_fp8 and is_float8_dtype(weight.dtype):
+                        weight = weight.half()
                     new_mod.weight.copy_(weight)
                 if has_bias and safe_getattr(module, 'bias') is not None:
                     new_mod.bias.copy_(module.bias)
@@ -384,6 +410,11 @@ def clone_module_simple(module, target_device):
         try:
             weight = safe_getattr(module, 'weight', None)
             weight_dtype = weight.dtype if weight is not None else torch.float32
+            
+            # Check FP8 support for target device
+            supports_fp8 = device_supports_float8(target_device)
+            if not supports_fp8 and is_float8_dtype(weight_dtype):
+                weight_dtype = torch.float16
             
             if isinstance(module, nn.LayerNorm):
                 new_mod = nn.LayerNorm(
@@ -412,6 +443,8 @@ def clone_module_simple(module, target_device):
             
             with torch.no_grad():
                 if weight is not None:
+                    if not supports_fp8 and is_float8_dtype(weight.dtype):
+                        weight = weight.half()
                     new_mod.weight.copy_(weight)
                 if safe_getattr(module, 'bias') is not None:
                     new_mod.bias.copy_(module.bias)
@@ -430,11 +463,17 @@ def clone_module_simple(module, target_device):
         new_mod = module_class.__new__(module_class)
         nn.Module.__init__(new_mod)
         
+        # Check if target supports FP8
+        supports_fp8 = device_supports_float8(target_device)
+        
         # Copy parameters
         for name, param in module.named_parameters(recurse=False):
             if param is not None:
-                new_param = nn.Parameter(param.clone().detach().to(device=target_device), 
-                                        requires_grad=False)
+                new_param_data = param.clone().detach()
+                # Convert FP8 to FP16 for older GPUs
+                if not supports_fp8 and is_float8_dtype(new_param_data.dtype):
+                    new_param_data = new_param_data.half()
+                new_param = nn.Parameter(new_param_data.to(device=target_device), requires_grad=False)
                 new_mod.register_parameter(name, new_param)
             else:
                 new_mod.register_parameter(name, None)
@@ -442,7 +481,11 @@ def clone_module_simple(module, target_device):
         # Copy buffers
         for name, buffer in module.named_buffers(recurse=False):
             if buffer is not None:
-                new_buffer = buffer.clone().detach().to(device=target_device)
+                new_buffer_data = buffer.clone().detach()
+                # Convert FP8 to FP16 for older GPUs
+                if not supports_fp8 and is_float8_dtype(new_buffer_data.dtype):
+                    new_buffer_data = new_buffer_data.half()
+                new_buffer = new_buffer_data.to(device=target_device)
                 new_mod.register_buffer(name, new_buffer)
             else:
                 new_mod.register_buffer(name, None)
@@ -477,12 +520,22 @@ def clone_module_simple(module, target_device):
                     if key in cache_attrs:
                         setattr(new_mod, key, None)
                     else:
-                        setattr(new_mod, key, value.clone().detach().to(target_device))
+                        tensor_val = value.clone().detach()
+                        # Convert FP8 to FP16 if needed
+                        if not supports_fp8 and is_float8_dtype(tensor_val.dtype):
+                            tensor_val = tensor_val.half()
+                        setattr(new_mod, key, tensor_val.to(target_device))
                 elif isinstance(value, (list, tuple)) and len(value) > 0 and isinstance(value[0], torch.Tensor):
                     if key in cache_attrs:
                         setattr(new_mod, key, None)
                     else:
-                        setattr(new_mod, key, type(value)(t.clone().detach().to(target_device) for t in value))
+                        converted = []
+                        for t in value:
+                            t_conv = t.clone().detach()
+                            if not supports_fp8 and is_float8_dtype(t_conv.dtype):
+                                t_conv = t_conv.half()
+                            converted.append(t_conv.to(target_device))
+                        setattr(new_mod, key, type(value)(converted))
                 else:
                     setattr(new_mod, key, copy.deepcopy(value))
             except Exception:
@@ -492,9 +545,8 @@ def clone_module_simple(module, target_device):
     except Exception as e:
         raise RuntimeError(f"Failed to clone module {module_class}: {e}")
 
-
 def safe_model_clone(source_model, target_device, disable_flash=False):
-    """FLUX-safe model cloning with explicit memory cleanup."""
+    """FLUX-safe model cloning with explicit memory cleanup and FP8 handling."""
     clear_flux_caches(source_model)
     
     # Determine source device
@@ -550,6 +602,8 @@ def safe_model_clone(source_model, target_device, disable_flash=False):
         
         # Load state dict piece by piece to minimize memory spike
         print(f"[ParallelAnything] Loading parameters incrementally...")
+        supports_fp8 = device_supports_float8(target_device)
+        
         with torch.no_grad():
             for key in list(state_dict.keys()):
                 try:
@@ -565,17 +619,19 @@ def safe_model_clone(source_model, target_device, disable_flash=False):
                         target_param = getattr(replica, key)
                     
                     if isinstance(target_param, (torch.nn.Parameter, torch.Tensor)):
-                        # Load directly to target device
-                        target_param.data.copy_(param.to(target_device, non_blocking=False))
-                    
-                    # Delete immediately to free memory
-                    del state_dict[key]
-                    del param
-                    
-                    # Periodic cleanup for very large models
-                    if len(state_dict) % 50 == 0 and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                        # Load directly to target device with FP8 handling
+                        param_data = param.to(target_device, non_blocking=False)
+                        if is_float8_dtype(param_data.dtype) and not supports_fp8:
+                            param_data = param_data.half()
+                        target_param.data.copy_(param_data)
                         
+                        # Delete immediately to free memory
+                        del state_dict[key]
+                        del param
+                        
+                        # Periodic cleanup for very large models
+                        if len(state_dict) % 50 == 0 and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                 except Exception as e:
                     print(f"[ParallelAnything] Warning: Could not load {key}: {e}")
         
@@ -606,6 +662,20 @@ def safe_model_clone(source_model, target_device, disable_flash=False):
     # Post-processing
     clear_flux_caches(replica)
     
+    # CRITICAL FIX: Convert FP8 to FP16 for older GPUs after cloning
+    if not device_supports_float8(target_device):
+        print(f"[ParallelAnything] Converting FP8 weights to FP16 for {target_device}...")
+        def convert_fp8_recursive(m):
+            for name, param in m.named_parameters():
+                if is_float8_dtype(param.dtype):
+                    param.data = param.data.half()
+            for name, buffer in m.named_buffers():
+                if is_float8_dtype(buffer.dtype):
+                    buffer.data = buffer.data.half()
+            for child in m.children():
+                convert_fp8_recursive(child)
+        convert_fp8_recursive(replica)
+    
     # Disable gradient checkpointing to save VRAM
     if hasattr(replica, 'gradient_checkpointing'):
         replica.gradient_checkpointing = False
@@ -633,7 +703,6 @@ def safe_model_clone(source_model, target_device, disable_flash=False):
     print(f"[ParallelAnything] Cloned via {method_used} to {target_device}")
     return replica
 
-
 def get_free_vram(device_name):
     """Get available VRAM in MB for a device."""
     try:
@@ -641,12 +710,11 @@ def get_free_vram(device_name):
             idx = int(device_name.split(":")[-1])
             torch.cuda.set_device(idx)
             free_memory = (torch.cuda.get_device_properties(idx).total_memory - 
-                          torch.cuda.memory_allocated(idx))
+                        torch.cuda.memory_allocated(idx))
             return free_memory / (1024 ** 2)  # Convert to MB
     except Exception:
         pass
     return 0
-
 
 def auto_split_batch(batch_size, devices, weights):
     """Adjust split based on available VRAM."""
@@ -679,10 +747,9 @@ def auto_split_batch(batch_size, devices, weights):
     adjusted_weights = [w/total for w in adjusted_weights]
     
     split_sizes = [max(1, int(batch_size * w)) for w in adjusted_weights]
-    split_sizes[-1] = batch_size - sum(split_sizes[:-1])  # Adjust last to ensure sum = batch_size
+    split_sizes[-1] = batch_size - sum(split_sizes[:-1])  # Ensure sum = batch_size
     
     return split_sizes
-
 
 class ParallelDevice:
     @classmethod
@@ -703,7 +770,7 @@ class ParallelDevice:
         except ImportError:
             pass
         return devices
-
+    
     @classmethod
     def INPUT_TYPES(s):
         available = s.get_available_devices()
@@ -734,7 +801,7 @@ class ParallelDevice:
     FUNCTION = "add_device"
     CATEGORY = "utils/hardware"
     DESCRIPTION = "Add a GPU/CPU/MPS/XPU device to the parallel processing chain"
-
+    
     def add_device(self, device_id, percentage, previous_devices=None):
         if previous_devices is None:
             previous_devices = []
@@ -747,8 +814,8 @@ class ParallelDevice:
         
         new_chain = previous_devices.copy()
         new_chain.append(config)
+        
         return (new_chain,)
-
 
 class ParallelDeviceList:
     @classmethod
@@ -763,7 +830,7 @@ class ParallelDeviceList:
             for i in range(torch.xpu.device_count()):
                 devices.append(f"xpu:{i}")
         return devices
-
+    
     @classmethod
     def INPUT_TYPES(s):
         devices = s.get_available_devices()
@@ -787,10 +854,12 @@ class ParallelDeviceList:
     RETURN_NAMES = ("device_chain",)
     FUNCTION = "create_list"
     CATEGORY = "utils/hardware"
-
-    def create_list(self, device_1, pct_1, device_2, pct_2, device_3="cpu", pct_3=0, device_4="cpu", pct_4=0):
+    
+    def create_list(self, device_1, pct_1, device_2, pct_2, 
+                   device_3="cpu", pct_3=0, device_4="cpu", pct_4=0):
         chain = []
-        devices = [(device_1, pct_1), (device_2, pct_2), (device_3, pct_3), (device_4, pct_4)]
+        devices = [(device_1, pct_1), (device_2, pct_2), 
+                  (device_3, pct_3), (device_4, pct_4)]
         
         for dev_str, pct in devices:
             if pct > 0:
@@ -801,7 +870,6 @@ class ParallelDeviceList:
                 })
         
         return (chain,)
-
 
 class ParallelAnything:
     @classmethod
@@ -835,9 +903,9 @@ class ParallelAnything:
     RETURN_NAMES = ("model",)
     FUNCTION = "setup_parallel"
     CATEGORY = "utils/hardware"
-
-    def setup_parallel(self, model, device_chain, workload_split=True, auto_vram_balance=False, 
-                      purge_cache=True, purge_models=False):
+    
+    def setup_parallel(self, model, device_chain, workload_split=True, 
+                      auto_vram_balance=False, purge_cache=True, purge_models=False):
         if model is None or not device_chain:
             return (model,)
         
@@ -905,7 +973,6 @@ class ParallelAnything:
             
             # Move original to CPU to free VRAM for cloning, unless it's the only device and matches
             needs_cpu_transition = original_device.type == 'cuda' and original_device_str not in device_names
-            
             if needs_cpu_transition:
                 print(f"[ParallelAnything] Moving model to CPU for safe cloning...")
                 target_model = target_model.cpu()
@@ -938,8 +1005,8 @@ class ParallelAnything:
                     
                     replica = safe_model_clone(target_model, dev, disable_flash=need_safe)
                     clear_flux_caches(replica)
-                    replicas[dev_name] = replica
                     
+                    replicas[dev_name] = replica
                     if dev.type == 'cuda':
                         streams[dev_name] = torch.cuda.Stream(dev)
                     
@@ -964,7 +1031,6 @@ class ParallelAnything:
                     raise RuntimeError("No devices available for parallel processing - all OOM")
                 print(f"[ParallelAnything] Reducing to {len(successful_devices)} devices due to OOM")
                 device_names = successful_devices
-                
                 # Renormalize weights
                 total_weight = sum(successful_weights)
                 weights = [w/total_weight for w in successful_weights]
@@ -1046,11 +1112,14 @@ class ParallelAnything:
                 return [x] * len(split_sizes)
         
         def move_to_device(x, device, non_blocking=False):
-            """Move tensor or list/tuple of tensors to device."""
+            """Move tensor or list/tuple of tensors to device with FP8 handling."""
             if isinstance(x, torch.Tensor):
                 # Only move if not already on target device
                 if x.device != torch.device(device):
-                    return x.to(device, non_blocking=non_blocking)
+                    x = x.to(device, non_blocking=non_blocking)
+                # CRITICAL FIX: Convert FP8 to FP16 for old GPUs
+                if is_float8_dtype(x.dtype) and not device_supports_float8(device):
+                    x = x.half()
                 return x
             elif isinstance(x, (list, tuple)):
                 moved = [move_to_device(t, device, non_blocking) for t in x]
@@ -1072,9 +1141,6 @@ class ParallelAnything:
                         split_lists = [torch.split(t, split_sizes, dim=0) for t in value]
                         for i in range(len(split_sizes)):
                             split_kwargs_list[i][key] = type(value)(sl[i] for sl in split_lists)
-                    else:
-                        for i in range(len(split_sizes)):
-                            split_kwargs_list[i][key] = value
                 else:
                     for i in range(len(split_sizes)):
                         split_kwargs_list[i][key] = value
@@ -1159,6 +1225,7 @@ class ParallelAnything:
                     c_chunks = split_batch(context, [a['size'] for a in active])
                 else:
                     c_chunks = [None] * len(active)
+                
                 kwargs_chunks = split_kwargs(kwargs, [a['size'] for a in active], batch_size)
                 
                 results = [None] * len(active)
@@ -1174,9 +1241,7 @@ class ParallelAnything:
                         # Move inputs to device
                         x_in = move_to_device(x_chunks[task_idx], dev)
                         t_in = move_to_device(t_chunks[task_idx], dev)
-                        c_in = None
-                        if c_chunks[task_idx] is not None:
-                            c_in = move_to_device(c_chunks[task_idx], dev)
+                        c_in = move_to_device(c_chunks[task_idx], dev) if c_chunks[task_idx] is not None else None
                         
                         # Move kwargs
                         k_in = {}
@@ -1184,7 +1249,6 @@ class ParallelAnything:
                             k_in[k] = move_to_device(v, dev, non_blocking=False)
                         
                         # CRITICAL FIX: Check if this is the original model to avoid recursion
-                        # If replica has _original_forward, it means it's the patched model, so use that
                         if hasattr(replica, '_original_forward'):
                             forward_fn = replica._original_forward
                         else:
@@ -1250,7 +1314,6 @@ class ParallelAnything:
                 if "out of memory" in str(e).lower():
                     print("[ParallelAnything] OOM in parallel forward, attempting emergency cleanup...")
                     aggressive_cleanup()
-                    
                     # Try single device fallback on lead device
                     print("[ParallelAnything] Falling back to single device processing...")
                     with torch.no_grad():
@@ -1281,7 +1344,6 @@ class ParallelAnything:
         
         print(f"[ParallelAnything] Parallel setup complete. Using devices: {device_names}")
         return (model,)
-
 
 NODE_CLASS_MAPPINGS = {
     "ParallelAnything": ParallelAnything,

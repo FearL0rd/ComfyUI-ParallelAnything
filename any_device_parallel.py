@@ -58,7 +58,6 @@ def disable_flash_xformers(model):
         ('_use_memory_efficient_attention', False),
         ('_flash_attention_enabled', False),
     ]
-    
     for attr_or_method, value in disable_configs:
         if hasattr(model, attr_or_method):
             try:
@@ -71,18 +70,16 @@ def disable_flash_xformers(model):
                     setattr(model, attr_or_method, value)
             except Exception:
                 pass
-    
+
     # Recursively check modules
     for name, module in model.named_modules():
         if any(x in name.lower() for x in ['attn', 'attention', 'transformer']):
-            for attr in ['use_xformers', 'use_flash_attention', 'use_flash_attention_2', 
-                        '_use_memory_efficient_attention', 'enable_flash', 'enable_xformers']:
+            for attr in ['use_xformers', 'use_flash_attention', 'use_flash_attention_2', '_use_memory_efficient_attention', 'enable_flash', 'enable_xformers']:
                 if hasattr(module, attr):
                     try:
                         setattr(module, attr, False)
                     except AttributeError:
                         pass
-            
             # Reset attention processor if diffusers-style
             if hasattr(module, 'set_processor'):
                 try:
@@ -101,9 +98,7 @@ def clear_flux_caches(model):
         'rope_cache', '_rope_cache', 'freqs_cis_cache', '_freqs_cis_cache',
         'temporal_ids', 'frame_ids', 'video_ids', 'temp_pos_emb',
     ]
-    
     cleared_count = 0
-    
     def clear_attrs(obj, name_prefix=""):
         nonlocal cleared_count
         for attr in cache_attrs:
@@ -115,7 +110,6 @@ def clear_flux_caches(model):
                         cleared_count += 1
                 except (AttributeError, TypeError):
                     pass
-    
     # Clear on model itself
     clear_attrs(model)
     # Clear on all submodules
@@ -146,7 +140,6 @@ def cleanup_parallel_model(model_ref):
     model = model_ref() if isinstance(model_ref, weakref.ref) else model_ref
     if model is None:
         return
-    
     if not getattr(model, '_true_parallel_active', False):
         return
     
@@ -181,7 +174,6 @@ def cleanup_parallel_model(model_ref):
                     replica._gradient_checkpointing_func = None
             except Exception as e:
                 print(f"[ParallelAnything] Warning: Error cleaning up replica on {dev_name}: {e}")
-        
         try:
             delattr(model, '_parallel_replicas')
         except Exception:
@@ -227,7 +219,6 @@ def cleanup_parallel_model(model_ref):
 def extract_model_config(model):
     """Extract initialization config from model instance with FLUX-specific handling."""
     config = {}
-    
     possible_attrs = [
         'in_channels', 'out_channels', 'vec_in_dim', 'context_in_dim', 'hidden_size',
         'mlp_ratio', 'num_heads', 'depth', 'depth_single_blocks', 'depth_single',
@@ -267,7 +258,7 @@ def extract_model_config(model):
                 params_dict = vars(params)
                 if params_dict:
                     config.update({k: v for k, v in params_dict.items() 
-                                 if not isinstance(v, (torch.Tensor, nn.Module))})
+                                  if not isinstance(v, (torch.Tensor, nn.Module))})
         except Exception:
             pass
     
@@ -277,7 +268,7 @@ def extract_model_config(model):
             cfg = model.config
             if isinstance(cfg, dict):
                 config.update({k: v for k, v in cfg.items() 
-                             if not isinstance(v, (torch.Tensor, nn.Module))})
+                              if not isinstance(v, (torch.Tensor, nn.Module))})
             else:
                 cfg_dict = {k: v for k, v in vars(cfg).items() 
                            if not k.startswith('_') and not callable(v) 
@@ -473,7 +464,8 @@ def clone_module_simple(module, target_device):
                 # Convert FP8 to FP16 for older GPUs
                 if not supports_fp8 and is_float8_dtype(new_param_data.dtype):
                     new_param_data = new_param_data.half()
-                new_param = nn.Parameter(new_param_data.to(device=target_device), requires_grad=False)
+                new_param = nn.Parameter(new_param_data.to(device=target_device), 
+                                        requires_grad=False)
                 new_mod.register_parameter(name, new_param)
             else:
                 new_mod.register_parameter(name, None)
@@ -499,15 +491,13 @@ def clone_module_simple(module, target_device):
         # Copy other attributes
         excluded_attrs = {
             '_parameters', '_buffers', '_modules', '_non_persistent_buffers_set',
-            '_backward_pre_hooks', '_backward_hooks', '_forward_pre_hooks', 
-            '_forward_hooks', '_state_dict_hooks', '_load_state_dict_pre_hooks',
-            '_extra_state', '_modules_to_load'
+            '_backward_pre_hooks', '_backward_hooks', '_forward_pre_hooks', '_forward_hooks',
+            '_state_dict_hooks', '_load_state_dict_pre_hooks', '_extra_state', '_modules_to_load'
         }
         cache_attrs = {
-            'img_ids', 'txt_ids', '_img_ids', '_txt_ids', 'cached_img_ids', 
-            'cached_txt_ids', 'pos_emb', '_pos_emb', 'pos_embed', '_pos_embed',
-            'freqs_cis', '_freqs_cis', 'freqs', '_freqs', 'cache', '_cache',
-            'kv_cache', '_kv_cache', 'attn_bias', '_attn_bias'
+            'img_ids', 'txt_ids', '_img_ids', '_txt_ids', 'cached_img_ids', 'cached_txt_ids',
+            'pos_emb', '_pos_emb', 'pos_embed', '_pos_embed', 'freqs_cis', '_freqs_cis',
+            'freqs', '_freqs', 'cache', '_cache', 'kv_cache', '_kv_cache', 'attn_bias', '_attn_bias'
         }
         
         for key, value in module.__dict__.items():
@@ -665,16 +655,25 @@ def safe_model_clone(source_model, target_device, disable_flash=False):
     # CRITICAL FIX: Convert FP8 to FP16 for older GPUs after cloning
     if not device_supports_float8(target_device):
         print(f"[ParallelAnything] Converting FP8 weights to FP16 for {target_device}...")
+        converted_from_fp8 = False
+        
         def convert_fp8_recursive(m):
+            nonlocal converted_from_fp8
             for name, param in m.named_parameters():
                 if is_float8_dtype(param.dtype):
                     param.data = param.data.half()
+                    converted_from_fp8 = True
             for name, buffer in m.named_buffers():
                 if is_float8_dtype(buffer.dtype):
                     buffer.data = buffer.data.half()
+                    converted_from_fp8 = True
             for child in m.children():
                 convert_fp8_recursive(child)
+        
         convert_fp8_recursive(replica)
+        if converted_from_fp8:
+            replica._converted_from_fp8 = True
+            print(f"[ParallelAnything] Converted FP8 weights to FP16 for {target_device}")
     
     # Disable gradient checkpointing to save VRAM
     if hasattr(replica, 'gradient_checkpointing'):
@@ -710,7 +709,7 @@ def get_free_vram(device_name):
             idx = int(device_name.split(":")[-1])
             torch.cuda.set_device(idx)
             free_memory = (torch.cuda.get_device_properties(idx).total_memory - 
-                        torch.cuda.memory_allocated(idx))
+                          torch.cuda.memory_allocated(idx))
             return free_memory / (1024 ** 2)  # Convert to MB
     except Exception:
         pass
@@ -782,10 +781,7 @@ class ParallelDevice:
                     "tooltip": "Select available compute device (CPU/CUDA/MPS/XPU)"
                 }),
                 "percentage": ("FLOAT", {
-                    "default": 50.0,
-                    "min": 1.0,
-                    "max": 100.0,
-                    "step": 1.0,
+                    "default": 50.0, "min": 1.0, "max": 100.0, "step": 1.0,
                     "tooltip": "Percentage of batch to process on this device"
                 }),
             },
@@ -801,7 +797,7 @@ class ParallelDevice:
     FUNCTION = "add_device"
     CATEGORY = "utils/hardware"
     DESCRIPTION = "Add a GPU/CPU/MPS/XPU device to the parallel processing chain"
-    
+
     def add_device(self, device_id, percentage, previous_devices=None):
         if previous_devices is None:
             previous_devices = []
@@ -854,12 +850,10 @@ class ParallelDeviceList:
     RETURN_NAMES = ("device_chain",)
     FUNCTION = "create_list"
     CATEGORY = "utils/hardware"
-    
-    def create_list(self, device_1, pct_1, device_2, pct_2, 
-                   device_3="cpu", pct_3=0, device_4="cpu", pct_4=0):
+
+    def create_list(self, device_1, pct_1, device_2, pct_2, device_3="cpu", pct_3=0, device_4="cpu", pct_4=0):
         chain = []
-        devices = [(device_1, pct_1), (device_2, pct_2), 
-                  (device_3, pct_3), (device_4, pct_4)]
+        devices = [(device_1, pct_1), (device_2, pct_2), (device_3, pct_3), (device_4, pct_4)]
         
         for dev_str, pct in devices:
             if pct > 0:
@@ -903,9 +897,9 @@ class ParallelAnything:
     RETURN_NAMES = ("model",)
     FUNCTION = "setup_parallel"
     CATEGORY = "utils/hardware"
-    
-    def setup_parallel(self, model, device_chain, workload_split=True, 
-                      auto_vram_balance=False, purge_cache=True, purge_models=False):
+
+    def setup_parallel(self, model, device_chain, workload_split=True, auto_vram_balance=False, 
+                      purge_cache=True, purge_models=False):
         if model is None or not device_chain:
             return (model,)
         
@@ -1005,8 +999,8 @@ class ParallelAnything:
                     
                     replica = safe_model_clone(target_model, dev, disable_flash=need_safe)
                     clear_flux_caches(replica)
-                    
                     replicas[dev_name] = replica
+                    
                     if dev.type == 'cuda':
                         streams[dev_name] = torch.cuda.Stream(dev)
                     
@@ -1056,6 +1050,7 @@ class ParallelAnything:
                         del r
                 except Exception:
                     pass
+            
             aggressive_cleanup()
             return (model,)
         
@@ -1212,7 +1207,16 @@ class ParallelAnything:
                 if len(active) == 1:
                     with torch.no_grad():
                         replica = active[0]['replica']
-                        # CRITICAL FIX: Use _original_forward to avoid recursion
+                        # Get model dtype - could be Float, Half, BFloat16, etc.
+                        model_dtype = next(replica.parameters()).dtype
+                        
+                        # CRITICAL FIX: Always ensure input dtype matches model dtype
+                        # This fixes both FP8->FP16 conversion and works for video models
+                        if x.dtype != model_dtype and x.is_floating_point():
+                            x = x.to(model_dtype)
+                        if context is not None and context.dtype != model_dtype and context.is_floating_point():
+                            context = context.to(model_dtype)
+                        
                         if hasattr(replica, '_original_forward'):
                             return replica._original_forward(x, timesteps, context=context, **kwargs)
                         else:
@@ -1221,6 +1225,7 @@ class ParallelAnything:
                 # Split inputs
                 x_chunks = split_batch(x, [a['size'] for a in active])
                 t_chunks = split_batch(timesteps, [a['size'] for a in active])
+                
                 if context is not None:
                     c_chunks = split_batch(context, [a['size'] for a in active])
                 else:
@@ -1243,12 +1248,26 @@ class ParallelAnything:
                         t_in = move_to_device(t_chunks[task_idx], dev)
                         c_in = move_to_device(c_chunks[task_idx], dev) if c_chunks[task_idx] is not None else None
                         
-                        # Move kwargs
+                        # CRITICAL FIX: Get model dtype and ensure inputs match it
+                        model_dtype = next(replica.parameters()).dtype
+                        
+                        # Convert floating point tensors to match model dtype
+                        # This handles: Flux FP16 model + BF16 inputs -> both FP16
+                        # And: WAN Float model + Float inputs -> both Float (no change)
+                        if x_in.dtype != model_dtype and x_in.is_floating_point():
+                            x_in = x_in.to(model_dtype)
+                        if c_in is not None and c_in.dtype != model_dtype and c_in.is_floating_point():
+                            c_in = c_in.to(model_dtype)
+                        
+                        # Move kwargs and ensure dtype compatibility
                         k_in = {}
                         for k, v in kwargs_chunks[task_idx].items():
-                            k_in[k] = move_to_device(v, dev, non_blocking=False)
+                            v_moved = move_to_device(v, dev, non_blocking=False)
+                            if isinstance(v_moved, torch.Tensor) and v_moved.is_floating_point() and v_moved.dtype != model_dtype:
+                                v_moved = v_moved.to(model_dtype)
+                            k_in[k] = v_moved
                         
-                        # CRITICAL FIX: Check if this is the original model to avoid recursion
+                        # Get forward function
                         if hasattr(replica, '_original_forward'):
                             forward_fn = replica._original_forward
                         else:
@@ -1282,6 +1301,7 @@ class ParallelAnything:
                         out = move_to_device(out, lead_device, non_blocking=False)
                         
                         return task_idx, out
+                        
                     except Exception as e:
                         return task_idx, e
                 
@@ -1314,6 +1334,7 @@ class ParallelAnything:
                 if "out of memory" in str(e).lower():
                     print("[ParallelAnything] OOM in parallel forward, attempting emergency cleanup...")
                     aggressive_cleanup()
+                    
                     # Try single device fallback on lead device
                     print("[ParallelAnything] Falling back to single device processing...")
                     with torch.no_grad():
@@ -1328,7 +1349,6 @@ class ParallelAnything:
         # Replace forward method
         target_model._original_forward = target_model.forward
         target_model.forward = types.MethodType(parallel_forward, target_model)
-        
         target_model._true_parallel_active = True
         target_model._parallel_replicas = replicas
         target_model._parallel_devices = device_names

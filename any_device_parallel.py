@@ -68,23 +68,22 @@ class ParallelBlock(nn.Module):
             return self.local_block(*args, **kwargs)
 
         target_device = self.owner_device
-        
+
         # --- CRITICAL FIX ---
-        # Do NOT check args[0].device to skip moving. 
-        # Main input might be on target_device (from prev block), 
+        # Do NOT check args[0].device to skip moving.
+        # Main input might be on target_device (from prev block),
         # but auxiliary inputs (timesteps, context) might still be on Lead Device.
         # We must ensure ALL inputs are on target_device.
-        
         args_moved = self._move_args(args, target_device)
         kwargs_moved = self._move_kwargs(kwargs, target_device)
-        
+
         # Execute on target replica
         out = self.owner_block(*args_moved, **kwargs_moved)
 
         if self.is_last_block:
             # Return data to Lead Device for final layers/output processing
             out = self._move_tensor(out, self.lead_device)
-                
+
         return out
 
 # ----------------------------------------------------------------------------
@@ -151,8 +150,7 @@ def disable_flash_xformers(model):
     
     for name, module in model.named_modules():
         if any(x in name.lower() for x in ['attn', 'attention', 'transformer']):
-            for attr in ['use_xformers', 'use_flash_attention', 'use_flash_attention_2', 
-                        '_use_memory_efficient_attention', 'enable_flash', 'enable_xformers']:
+            for attr in ['use_xformers', 'use_flash_attention', 'use_flash_attention_2', '_use_memory_efficient_attention', 'enable_flash', 'enable_xformers']:
                 if hasattr(module, attr):
                     try:
                         setattr(module, attr, False)
@@ -219,10 +217,10 @@ def cleanup_parallel_model(model_ref):
         return
     
     print("[ParallelAnything] Cleaning up parallel model...")
-    
     should_purge_cache = getattr(model, '_parallel_purge_cache', True)
     should_purge_models = getattr(model, '_parallel_purge_models', False)
     
+    # Restore original forward
     if hasattr(model, '_original_forward'):
         try:
             model.forward = model._original_forward
@@ -230,6 +228,7 @@ def cleanup_parallel_model(model_ref):
         except Exception:
             pass
     
+    # Cleanup replicas
     if hasattr(model, '_parallel_replicas'):
         replicas = model._parallel_replicas
         for dev_name, replica in list(replicas.items()):
@@ -243,12 +242,12 @@ def cleanup_parallel_model(model_ref):
                     replica._gradient_checkpointing_func = None
             except Exception as e:
                 print(f"[ParallelAnything] Warning: Error cleaning up replica on {dev_name}: {e}")
-        
         try:
             delattr(model, '_parallel_replicas')
         except Exception:
             pass
     
+    # Clear other attributes
     for attr in ['_true_parallel_active', '_parallel_devices', '_parallel_streams', 
                  '_parallel_weights', '_auto_vram_balance', '_parallel_purge_cache', 
                  '_parallel_purge_models']:
@@ -274,14 +273,13 @@ def cleanup_parallel_model(model_ref):
             comfy.model_management.soft_empty_cache()
         except:
             pass
-    
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
-            try:
-                with torch.cuda.device(f'cuda:{i}'):
-                    torch.cuda.empty_cache()
-            except:
-                pass
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                try:
+                    with torch.cuda.device(f'cuda:{i}'):
+                        torch.cuda.empty_cache()
+                except:
+                    pass
 
 def extract_model_config(model):
     config = {}
@@ -290,11 +288,11 @@ def extract_model_config(model):
         'mlp_ratio', 'num_heads', 'depth', 'depth_single_blocks', 'depth_single',
         'axes_dim', 'theta', 'patch_size', 'qkv_bias', 'guidance_embed',
         'txt_ids_dim', 'img_ids_dim', 'num_res_blocks', 'attention_resolutions',
-        'dropout', 'channel_mult', 'num_classes', 'use_checkpoint',
-        'num_heads_upsample', 'use_scale_shift_norm', 'resblock_updown',
-        'use_new_attention_order', 'adm_in_channels', 'num_noises', 'context_dim',
-        'n_heads', 'd_head', 'transformer_depth', 'model_channels', 'max_depth',
-        'num_frames', 'temporal_compression', 'temporal_dim', 'video_length',
+        'dropout', 'channel_mult', 'num_classes', 'use_checkpoint', 'num_heads_upsample',
+        'use_scale_shift_norm', 'resblock_updown', 'use_new_attention_order',
+        'adm_in_channels', 'num_noises', 'context_dim', 'n_heads', 'd_head',
+        'transformer_depth', 'model_channels', 'max_depth', 'num_frames',
+        'temporal_compression', 'temporal_dim', 'video_length',
     ]
     
     for attr in possible_attrs:
@@ -322,8 +320,7 @@ def extract_model_config(model):
             else:
                 params_dict = vars(params)
                 if params_dict:
-                    config.update({k: v for k, v in params_dict.items() 
-                                 if not isinstance(v, (torch.Tensor, nn.Module))})
+                    config.update({k: v for k, v in params_dict.items() if not isinstance(v, (torch.Tensor, nn.Module))})
         except Exception:
             pass
     
@@ -331,19 +328,15 @@ def extract_model_config(model):
         try:
             cfg = model.config
             if isinstance(cfg, dict):
-                config.update({k: v for k, v in cfg.items() 
-                             if not isinstance(v, (torch.Tensor, nn.Module))})
+                config.update({k: v for k, v in cfg.items() if not isinstance(v, (torch.Tensor, nn.Module))})
             else:
-                cfg_dict = {k: v for k, v in vars(cfg).items() 
-                           if not k.startswith('_') and not callable(v) 
-                           and not isinstance(v, (torch.Tensor, nn.Module))}
+                cfg_dict = {k: v for k, v in vars(cfg).items() if not k.startswith('_') and not callable(v) and not isinstance(v, (torch.Tensor, nn.Module))}
                 config.update(cfg_dict)
         except Exception:
             pass
     
     if hasattr(model, 'unet_config') and isinstance(model.unet_config, dict):
-        config.update({k: v for k, v in model.unet_config.items() 
-                      if not isinstance(v, (torch.Tensor, nn.Module))})
+        config.update({k: v for k, v in model.unet_config.items() if not isinstance(v, (torch.Tensor, nn.Module))})
     
     clean_config = {}
     for k, v in config.items():
@@ -385,6 +378,7 @@ def clone_dataclass_or_object(obj, target_device=None):
             return obj.__class__(**field_values)
         except Exception:
             pass
+    
     try:
         return copy.deepcopy(obj)
     except Exception:
@@ -410,22 +404,41 @@ def clone_module_simple(module, target_device):
                 weight_dtype = torch.float16
             
             if isinstance(module, nn.Linear):
-                new_mod = nn.Linear(safe_getattr(module, 'in_features'), safe_getattr(module, 'out_features'), 
-                                  bias=has_bias, device=target_device, dtype=weight_dtype)
+                new_mod = nn.Linear(
+                    safe_getattr(module, 'in_features'),
+                    safe_getattr(module, 'out_features'),
+                    bias=has_bias,
+                    device=target_device,
+                    dtype=weight_dtype
+                )
             elif isinstance(module, nn.Conv2d):
-                new_mod = nn.Conv2d(safe_getattr(module, 'in_channels'), safe_getattr(module, 'out_channels'),
-                                  safe_getattr(module, 'kernel_size', 1), stride=safe_getattr(module, 'stride', 1),
-                                  padding=safe_getattr(module, 'padding', 0), dilation=safe_getattr(module, 'dilation', 1),
-                                  groups=safe_getattr(module, 'groups', 1), bias=has_bias,
-                                  padding_mode=safe_getattr(module, 'padding_mode', 'zeros'),
-                                  device=target_device, dtype=weight_dtype)
+                new_mod = nn.Conv2d(
+                    safe_getattr(module, 'in_channels'),
+                    safe_getattr(module, 'out_channels'),
+                    safe_getattr(module, 'kernel_size', 1),
+                    stride=safe_getattr(module, 'stride', 1),
+                    padding=safe_getattr(module, 'padding', 0),
+                    dilation=safe_getattr(module, 'dilation', 1),
+                    groups=safe_getattr(module, 'groups', 1),
+                    bias=has_bias,
+                    padding_mode=safe_getattr(module, 'padding_mode', 'zeros'),
+                    device=target_device,
+                    dtype=weight_dtype
+                )
             elif isinstance(module, nn.Conv1d):
-                new_mod = nn.Conv1d(safe_getattr(module, 'in_channels'), safe_getattr(module, 'out_channels'),
-                                  safe_getattr(module, 'kernel_size', 1), stride=safe_getattr(module, 'stride', 1),
-                                  padding=safe_getattr(module, 'padding', 0), dilation=safe_getattr(module, 'dilation', 1),
-                                  groups=safe_getattr(module, 'groups', 1), bias=has_bias,
-                                  padding_mode=safe_getattr(module, 'padding_mode', 'zeros'),
-                                  device=target_device, dtype=weight_dtype)
+                new_mod = nn.Conv1d(
+                    safe_getattr(module, 'in_channels'),
+                    safe_getattr(module, 'out_channels'),
+                    safe_getattr(module, 'kernel_size', 1),
+                    stride=safe_getattr(module, 'stride', 1),
+                    padding=safe_getattr(module, 'padding', 0),
+                    dilation=safe_getattr(module, 'dilation', 1),
+                    groups=safe_getattr(module, 'groups', 1),
+                    bias=has_bias,
+                    padding_mode=safe_getattr(module, 'padding_mode', 'zeros'),
+                    device=target_device,
+                    dtype=weight_dtype
+                )
             
             with torch.no_grad():
                 if weight is not None:
@@ -442,27 +455,37 @@ def clone_module_simple(module, target_device):
         try:
             weight = safe_getattr(module, 'weight', None)
             weight_dtype = weight.dtype if weight is not None else torch.float32
-            
             supports_fp8 = device_supports_float8(target_device)
             if not supports_fp8 and is_float8_dtype(weight_dtype):
                 weight_dtype = torch.float16
             
             if isinstance(module, nn.LayerNorm):
-                new_mod = nn.LayerNorm(safe_getattr(module, 'normalized_shape'),
-                                     eps=safe_getattr(module, 'eps', 1e-5),
-                                     elementwise_affine=safe_getattr(module, 'elementwise_affine', True),
-                                     device=target_device, dtype=weight_dtype)
+                new_mod = nn.LayerNorm(
+                    safe_getattr(module, 'normalized_shape'),
+                    eps=safe_getattr(module, 'eps', 1e-5),
+                    elementwise_affine=safe_getattr(module, 'elementwise_affine', True),
+                    device=target_device,
+                    dtype=weight_dtype
+                )
             elif isinstance(module, nn.BatchNorm2d):
-                new_mod = nn.BatchNorm2d(safe_getattr(module, 'num_features'),
-                                       eps=safe_getattr(module, 'eps', 1e-5),
-                                       momentum=safe_getattr(module, 'momentum', 0.1),
-                                       affine=safe_getattr(module, 'affine', True),
-                                       track_running_stats=safe_getattr(module, 'track_running_stats', True),
-                                       device=target_device, dtype=weight_dtype)
+                new_mod = nn.BatchNorm2d(
+                    safe_getattr(module, 'num_features'),
+                    eps=safe_getattr(module, 'eps', 1e-5),
+                    momentum=safe_getattr(module, 'momentum', 0.1),
+                    affine=safe_getattr(module, 'affine', True),
+                    track_running_stats=safe_getattr(module, 'track_running_stats', True),
+                    device=target_device,
+                    dtype=weight_dtype
+                )
             elif isinstance(module, nn.GroupNorm):
-                new_mod = nn.GroupNorm(safe_getattr(module, 'num_groups'), safe_getattr(module, 'num_channels'),
-                                     eps=safe_getattr(module, 'eps', 1e-5), affine=safe_getattr(module, 'affine', True),
-                                     device=target_device, dtype=weight_dtype)
+                new_mod = nn.GroupNorm(
+                    safe_getattr(module, 'num_groups'),
+                    safe_getattr(module, 'num_channels'),
+                    eps=safe_getattr(module, 'eps', 1e-5),
+                    affine=safe_getattr(module, 'affine', True),
+                    device=target_device,
+                    dtype=weight_dtype
+                )
             
             with torch.no_grad():
                 if weight is not None:
@@ -485,6 +508,7 @@ def clone_module_simple(module, target_device):
         nn.Module.__init__(new_mod)
         supports_fp8 = device_supports_float8(target_device)
         
+        # Copy parameters
         for name, param in module.named_parameters(recurse=False):
             if param is not None:
                 new_param_data = param.clone().detach()
@@ -495,6 +519,7 @@ def clone_module_simple(module, target_device):
             else:
                 new_mod.register_parameter(name, None)
         
+        # Copy buffers
         for name, buffer in module.named_buffers(recurse=False):
             if buffer is not None:
                 new_buffer_data = buffer.clone().detach()
@@ -505,22 +530,23 @@ def clone_module_simple(module, target_device):
             else:
                 new_mod.register_buffer(name, None)
         
+        # Recursively clone children
         for name, child in module.named_children():
             if child is not None:
                 cloned_child = clone_module_simple(child, target_device)
                 new_mod.add_module(name, cloned_child)
         
+        # Copy other attributes
         excluded_attrs = {
             '_parameters', '_buffers', '_modules', '_non_persistent_buffers_set',
-            '_backward_pre_hooks', '_backward_hooks', '_forward_pre_hooks', 
+            '_backward_pre_hooks', '_backward_hooks', '_forward_pre_hooks',
             '_forward_hooks', '_state_dict_hooks', '_load_state_dict_pre_hooks',
             '_extra_state', '_modules_to_load'
         }
         cache_attrs = {
-            'img_ids', 'txt_ids', '_img_ids', '_txt_ids', 'cached_img_ids', 
-            'cached_txt_ids', 'pos_emb', '_pos_emb', 'pos_embed', '_pos_embed',
-            'freqs_cis', '_freqs_cis', 'freqs', '_freqs', 'cache', '_cache',
-            'kv_cache', '_kv_cache', 'attn_bias', '_attn_bias'
+            'img_ids', 'txt_ids', '_img_ids', '_txt_ids', 'cached_img_ids', 'cached_txt_ids',
+            'pos_emb', '_pos_emb', 'pos_embed', '_pos_embed', 'freqs_cis', '_freqs_cis',
+            'freqs', '_freqs', 'cache', '_cache', 'kv_cache', '_kv_cache', 'attn_bias', '_attn_bias'
         }
         
         for key, value in module.__dict__.items():
@@ -570,7 +596,8 @@ def safe_model_clone(source_model, target_device, disable_flash=False):
         clear_flux_caches(source_model)
         return source_model
     
-    if src_device.type != 'cpu':
+    # Move to CPU first if on GPU
+    if src_device.type == 'cuda':
         model_cpu = source_model.cpu()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -627,17 +654,16 @@ def safe_model_clone(source_model, target_device, disable_flash=False):
                         if is_float8_dtype(param_data.dtype) and not supports_fp8:
                             param_data = param_data.half()
                         target_param.data.copy_(param_data)
-                        
-                        del state_dict[key]
-                        del param
-                        
-                        if len(state_dict) % 50 == 0 and torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                    
+                    del state_dict[key]
+                    del param
+                    if len(state_dict) % 50 == 0 and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                 except Exception as e:
                     print(f"[ParallelAnything] Warning: Could not load {key}: {e}")
         
         del state_dict
-        if src_device.type != 'cpu':
+        if src_device.type != 'cuda':
             del model_cpu
         gc.collect()
         if torch.cuda.is_available():
@@ -648,11 +674,9 @@ def safe_model_clone(source_model, target_device, disable_flash=False):
     except Exception as recon_error:
         print(f"[ParallelAnything] Config reconstruction failed: {recon_error}")
         print(f"[ParallelAnything] Attempting manual recursive cloning...")
-        
         replica = clone_module_simple(model_cpu, target_device)
         method_used = "manual_recursive_clone"
-        
-        if src_device.type != 'cpu':
+        if src_device.type != 'cuda':
             del model_cpu
         gc.collect()
     
@@ -678,7 +702,6 @@ def safe_model_clone(source_model, target_device, disable_flash=False):
         replica.gradient_checkpointing = False
     if hasattr(replica, '_gradient_checkpointing_func'):
         replica._gradient_checkpointing_func = None
-    
     if hasattr(replica, 'hooks'):
         replica.hooks = []
     if hasattr(replica, '_hf_hook'):
@@ -703,8 +726,9 @@ def get_free_vram(device_name):
         if device_name.startswith("cuda"):
             idx = int(device_name.split(":")[-1])
             torch.cuda.set_device(idx)
-            free_memory = (torch.cuda.get_device_properties(idx).total_memory - 
-                        torch.cuda.memory_allocated(idx))
+            free_memory = (
+                torch.cuda.get_device_properties(idx).total_memory - torch.cuda.memory_allocated(idx)
+            )
             return free_memory / (1024 ** 2)
     except Exception:
         pass
@@ -739,7 +763,6 @@ def auto_split_batch(batch_size, devices, weights):
     
     split_sizes = [max(1, int(batch_size * w)) for w in adjusted_weights]
     split_sizes[-1] = batch_size - sum(split_sizes[:-1])
-    
     return split_sizes
 
 class ParallelDevice:
@@ -761,7 +784,7 @@ class ParallelDevice:
         except ImportError:
             pass
         return devices
-    
+
     @classmethod
     def INPUT_TYPES(s):
         available = s.get_available_devices()
@@ -786,13 +809,13 @@ class ParallelDevice:
                 }),
             }
         }
-    
+
     RETURN_TYPES = ("DEVICE_CHAIN",)
     RETURN_NAMES = ("device_chain",)
     FUNCTION = "add_device"
     CATEGORY = "utils/hardware"
     DESCRIPTION = "Add a GPU/CPU/MPS/XPU device to the parallel processing chain"
-    
+
     def add_device(self, device_id, percentage, previous_devices=None):
         if previous_devices is None:
             previous_devices = []
@@ -821,7 +844,7 @@ class ParallelDeviceList:
             for i in range(torch.xpu.device_count()):
                 devices.append(f"xpu:{i}")
         return devices
-    
+
     @classmethod
     def INPUT_TYPES(s):
         devices = s.get_available_devices()
@@ -840,18 +863,15 @@ class ParallelDeviceList:
                 "pct_4": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 1.0}),
             }
         }
-    
+
     RETURN_TYPES = ("DEVICE_CHAIN",)
     RETURN_NAMES = ("device_chain",)
     FUNCTION = "create_list"
     CATEGORY = "utils/hardware"
-    
-    def create_list(self, device_1, pct_1, device_2, pct_2, 
-                   device_3="cpu", pct_3=0, device_4="cpu", pct_4=0):
+
+    def create_list(self, device_1, pct_1, device_2, pct_2, device_3="cpu", pct_3=0, device_4="cpu", pct_4=0):
         chain = []
-        devices = [(device_1, pct_1), (device_2, pct_2), 
-                  (device_3, pct_3), (device_4, pct_4)]
-        
+        devices = [(device_1, pct_1), (device_2, pct_2), (device_3, pct_3), (device_4, pct_4)]
         for dev_str, pct in devices:
             if pct > 0:
                 chain.append({
@@ -859,7 +879,6 @@ class ParallelDeviceList:
                     "percentage": float(pct),
                     "weight": float(pct) / 100.0
                 })
-        
         return (chain,)
 
 class ParallelAnything:
@@ -889,19 +908,102 @@ class ParallelAnything:
                 }),
             }
         }
-    
+
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "setup_parallel"
     CATEGORY = "utils/hardware"
-    
-    def setup_parallel(self, model, device_chain, workload_split=True, 
-                      auto_vram_balance=False, purge_cache=True, purge_models=False):
+
+    def setup_parallel(self, model, device_chain, workload_split=True, auto_vram_balance=False, purge_cache=True, purge_models=False):
         if model is None or not device_chain:
             return (model,)
+            
+        # Extract the diffusion model from ComfyUI model wrapper
+        if hasattr(model, 'model') and hasattr(model.model, 'diffusion_model'):
+            target_model = model.model.diffusion_model
+            model_wrapper = model
+        elif hasattr(model, 'diffusion_model'):
+            target_model = model.diffusion_model
+            model_wrapper = None
+        else:
+            target_model = model
+            model_wrapper = None
+
+        # CRITICAL FIX: Check if model is stranded on CPU BEFORE determining original_device
+        # This happens when previous run moved it to CPU for safe cloning but didn't restore it
+        try:
+            current_device = next(target_model.parameters()).device
+            if current_device.type == 'cpu':
+                # Check if ComfyUI expects it elsewhere (load_device hint)
+                expected_device = None
+                if hasattr(model, 'load_device'):
+                    expected_device = model.load_device
+                elif hasattr(model, 'model') and hasattr(model.model, 'load_device'):
+                    expected_device = model.model.load_device
+                
+                # If we have a hint that it should be on CUDA, restore it
+                if expected_device is not None and expected_device.type == 'cuda':
+                    print(f"[ParallelAnything] Restoring stranded model from CPU to {expected_device}")
+                    target_model = target_model.to(str(expected_device))
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                # Also check model_management's current device
+                else:
+                    mgmt_device = comfy.model_management.get_torch_device()
+                    if mgmt_device.type == 'cuda':
+                        print(f"[ParallelAnything] Restoring stranded model from CPU to {mgmt_device}")
+                        target_model = target_model.to(mgmt_device)
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+        except StopIteration:
+            pass
+        except Exception as e:
+            print(f"[ParallelAnything] Warning during CPU restoration: {e}")
+
+        # NOW determine original device after potential restoration
+        try:
+            original_device = next(target_model.parameters()).device
+            original_device_str = str(original_device)
+        except StopIteration:
+            original_device = torch.device('cpu')
+            original_device_str = "cpu"
+
+        # Check if ComfyUI model has patches (LoRAs) that need to be applied
+        has_lora_patches = False
+        patches_location = None
         
-        target_model = model.model.diffusion_model
-        
+        if model_wrapper is not None:
+            # Check various locations where ComfyUI might store patches
+            locations = [
+                ('patches', lambda m: m.patches),
+                ('model_patcher.patches', lambda m: m.model_patcher.patches if hasattr(m, 'model_patcher') else None),
+                ('model_patcher.patches_dict', lambda m: m.model_patcher.patches_dict if hasattr(m, 'model_patcher') else None),
+            ]
+            for name, getter in locations:
+                try:
+                    val = getter(model_wrapper)
+                    if val and len(val) > 0:
+                        has_lora_patches = True
+                        patches_location = name
+                        print(f"[ParallelAnything] Found {len(val)} patches in {name}")
+                except Exception:
+                    pass
+
+        # Apply patches if found
+        if has_lora_patches:
+            try:
+                print("[ParallelAnything] Applying LoRA/Custom patches before cloning...")
+                if hasattr(model_wrapper, 'patch_model'):
+                    model_wrapper.patch_model(device_to=comfy.model_management.get_torch_device())
+                    print("[ParallelAnything] Patches applied successfully")
+                elif hasattr(model_wrapper, 'model_patcher') and hasattr(model_wrapper.model_patcher, 'patch_model'):
+                    model_wrapper.model_patcher.patch_model(device_to=comfy.model_management.get_torch_device())
+                    print("[ParallelAnything] Patches applied via model_patcher")
+            except Exception as e:
+                print(f"[ParallelAnything] Warning: Could not apply patches: {e}")
+                has_lora_patches = False
+
+        # Cleanup previous parallel setup if exists
         if hasattr(target_model, "_true_parallel_active"):
             print("[ParallelAnything] Cleaning up previous parallel setup...")
             cleanup_parallel_model(target_model)
@@ -965,7 +1067,12 @@ class ParallelAnything:
                 dev = torch.device(dev_name)
                 need_safe = dev_name in devices_needing_safe_attention
                 
-                if dev_name == original_device_str and not needs_cpu_transition:
+                # Determine if this is the original device
+                is_original_device = (dev_name == original_device_str and not needs_cpu_transition)
+                
+                # CRITICAL FIX: If we have LoRA patches, we MUST clone even the original device
+                # because ComfyUI will manage the original model's weights separately
+                if is_original_device and not has_lora_patches:
                     print(f"[ParallelAnything] Using original model for {dev_name} (skipping clone)")
                     replicas[dev_name] = target_model
                     if dev.type == 'cuda':
@@ -975,7 +1082,10 @@ class ParallelAnything:
                     continue
                 
                 try:
-                    print(f"[ParallelAnything] Cloning to {dev_name} ({i+1}/{len(device_names)})...")
+                    if is_original_device and has_lora_patches:
+                        print(f"[ParallelAnything] Cloning to {dev_name} (preserving LoRA weights)...")
+                    else:
+                        print(f"[ParallelAnything] Cloning to {dev_name} ({i+1}/{len(device_names)})...")
                     
                     if dev.type == 'cuda':
                         idx = dev.index if dev.index is not None else int(dev_name.split(":")[-1])
@@ -985,15 +1095,20 @@ class ParallelAnything:
                     
                     replica = safe_model_clone(target_model, dev, disable_flash=need_safe)
                     clear_flux_caches(replica)
-                    
                     replicas[dev_name] = replica
+                    
                     if dev.type == 'cuda':
                         streams[dev_name] = torch.cuda.Stream(dev)
                     
-                    print(f"[ParallelAnything] ✓ {dev_name}" + (" (Safe mode)" if need_safe else ""))
+                    status_msg = f"[ParallelAnything] ✓ {dev_name}"
+                    if need_safe:
+                        status_msg += " (Safe mode)"
+                    if has_lora_patches:
+                        status_msg += " (LoRA active)"
+                    print(status_msg)
+                    
                     successful_devices.append(dev_name)
                     successful_weights.append(weights[i])
-                    
                     aggressive_cleanup()
                     
                 except RuntimeError as e:
@@ -1012,6 +1127,7 @@ class ParallelAnything:
                 total_weight = sum(successful_weights)
                 weights = [w/total_weight for w in successful_weights]
             
+            # Restore original to its device if we moved it to CPU and it's not in our replicas
             if needs_cpu_transition and original_device_str not in replicas:
                 try:
                     print(f"[ParallelAnything] Restoring original model to {original_device}")
@@ -1032,24 +1148,21 @@ class ParallelAnything:
                     pass
             aggressive_cleanup()
             return (model,)
-
-        print("[ParallelAnything] Configuring Model/Pipeline Parallelism for Batch=1...")
         
+        print("[ParallelAnything] Configuring Model/Pipeline Parallelism for Batch=1...")
         lead_device_name = device_names[0]
         lead_replica = replicas[lead_device_name]
         
         block_lists = ['double_blocks', 'single_blocks', 'transformer_blocks', 'layers']
-        
         for list_name in block_lists:
             if hasattr(lead_replica, list_name):
                 local_blocks = getattr(lead_replica, list_name)
                 if not isinstance(local_blocks, nn.ModuleList):
                     continue
-                
                 num_blocks = len(local_blocks)
                 if num_blocks == 0:
                     continue
-
+                
                 print(f"[ParallelAnything] Configuring {list_name} ({num_blocks} blocks) for pipeline execution...")
                 
                 device_assignments = []
@@ -1058,7 +1171,6 @@ class ParallelAnything:
                     count = int(round(weight * num_blocks))
                     if i == len(weights) - 1:
                         count = num_blocks - current_block
-                    
                     target_dev = torch.device(device_names[i])
                     for _ in range(count):
                         if current_block < num_blocks:
@@ -1067,7 +1179,6 @@ class ParallelAnything:
                 
                 for idx in range(num_blocks):
                     assigned_dev = device_assignments[idx]
-                    
                     peers = {}
                     for d_name, r in replicas.items():
                         if hasattr(r, list_name):
@@ -1084,9 +1195,8 @@ class ParallelAnything:
                         is_last_block=is_last,
                         lead_device=torch.device(lead_device_name)
                     )
-                    
                     local_blocks[idx] = wrapper
-
+        
         target_model._parallel_purge_cache = purge_cache
         target_model._parallel_purge_models = purge_models
         
@@ -1182,6 +1292,7 @@ class ParallelAnything:
                     print(f"[ParallelAnything] Error: {e}")
                     raise
                 
+                # Pipeline mode for batch_size == 1
                 if batch_size == 1 and workload_split:
                     set_pipeline_mode(True)
                     try:
@@ -1193,6 +1304,7 @@ class ParallelAnything:
                     finally:
                         set_pipeline_mode(False)
                 
+                # Single device fallback if batch too small or workload_split disabled
                 if batch_size < len(devices_ref) or not workload_split:
                     set_pipeline_mode(False)
                     with torch.no_grad():
@@ -1202,6 +1314,7 @@ class ParallelAnything:
                         else:
                             return first_replica(x, timesteps, context=context, **kwargs)
                 
+                # Data parallelism for batch_size > 1
                 if auto_balance_ref:
                     split_sizes = auto_split_batch(batch_size, list(devices_ref), list(weights_ref))
                 else:
@@ -1234,6 +1347,7 @@ class ParallelAnything:
                 
                 x_chunks = split_batch(x, [a['size'] for a in active])
                 t_chunks = split_batch(timesteps, [a['size'] for a in active])
+                
                 if context is not None:
                     c_chunks = split_batch(context, [a['size'] for a in active])
                 else:
@@ -1293,6 +1407,7 @@ class ParallelAnything:
                         
                         out = move_to_device(out, lead_device, non_blocking=False)
                         return task_idx, out
+                    
                     except Exception as e:
                         return task_idx, e
                 
@@ -1334,7 +1449,6 @@ class ParallelAnything:
         
         target_model._original_forward = target_model.forward
         target_model.forward = types.MethodType(parallel_forward, target_model)
-        
         target_model._true_parallel_active = True
         target_model._parallel_replicas = replicas
         target_model._parallel_devices = device_names
@@ -1344,9 +1458,16 @@ class ParallelAnything:
         
         weakref.finalize(model, cleanup_parallel_model, weakref.ref(target_model))
         
-        model.load_device = lead_device
+        # Update ComfyUI's model device tracking to point to lead device
+        if hasattr(model, 'load_device'):
+            model.load_device = lead_device
+        elif hasattr(model, 'model') and hasattr(model.model, 'load_device'):
+            model.model.load_device = lead_device
         
         print(f"[ParallelAnything] Parallel setup complete. Devices: {device_names}")
+        if has_lora_patches:
+            print("[ParallelAnything] LoRA weights synchronized across all devices")
+        
         return (model,)
 
 NODE_CLASS_MAPPINGS = {

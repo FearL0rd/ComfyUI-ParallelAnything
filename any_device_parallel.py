@@ -503,6 +503,41 @@ def clone_module_simple(module, target_device):
         except Exception as e:
             print(f"[ParallelAnything] Warning: Failed to reconstruct norm layer {module_class}: {e}")
     
+
+    is_ggml_layer = False
+    try:
+        from gguf.ops import GGMLLayer as GGMLLayer1
+        if isinstance(module, GGMLLayer1):
+            is_ggml_layer = True
+    except ImportError:
+        pass
+    if not is_ggml_layer:
+        try:
+            from gguf.pig import GGMLLayer as GGMLLayer2
+            if isinstance(module, GGMLLayer2):
+                is_ggml_layer = True
+        except ImportError:
+            pass
+
+    if is_ggml_layer:
+        try:
+            new_mod = module_class.__new__(module_class)
+            nn.Module.__init__(new_mod)
+            for name, value in module.__dict__.items():
+                if name in ('weight', 'bias'):
+                    continue
+                try:
+                    setattr(new_mod, name, copy.deepcopy(value))
+                except Exception:
+                    pass
+            if hasattr(module, 'weight') and module.weight is not None:
+                new_mod.weight = module.weight.to(target_device)
+            if hasattr(module, 'bias') and module.bias is not None:
+                new_mod.bias = module.bias.to(target_device)
+            return new_mod
+        except Exception as e:
+            print(f"[ParallelAnything] Warning: Failed to reconstruct GGML layer {module_class}: {e}")
+
     try:
         new_mod = module_class.__new__(module_class)
         nn.Module.__init__(new_mod)

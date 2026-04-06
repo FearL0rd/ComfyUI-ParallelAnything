@@ -518,6 +518,13 @@ def clone_module_simple(module, target_device):
                 is_ggml_layer = True
         except ImportError:
             pass
+    if not is_ggml_layer:
+        try:
+            from ComfyUI-GGUF.ops import GGMLLayer as GGMLLayer3
+            if isinstance(module, GGMLLayer3):
+                is_ggml_layer = True
+        except ImportError:
+            pass
 
     if is_ggml_layer:
         try:

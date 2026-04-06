@@ -520,10 +520,11 @@ def clone_module_simple(module, target_device):
             pass
     if not is_ggml_layer:
         try:
-            from ComfyUI-GGUF.ops import GGMLLayer as GGMLLayer3
-            if isinstance(module, GGMLLayer3):
+            import importlib
+            gguf_mod = importlib.import_module('ComfyUI-GGUF.ops')
+            if isinstance(module, gguf_mod.GGMLLayer):
                 is_ggml_layer = True
-        except ImportError:
+        except (ImportError, ModuleNotFoundError):
             pass
 
     if is_ggml_layer:

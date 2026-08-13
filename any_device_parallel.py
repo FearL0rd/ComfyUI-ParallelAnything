@@ -6,7 +6,7 @@ import gc
 import weakref
 import threading
 from types import SimpleNamespace
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import fields, is_dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import comfy.model_management
 
@@ -21,6 +21,453 @@ def get_pipeline_mode():
 def set_pipeline_mode(active):
     _pipeline_state.active = active
 
+def as_torch_device(device):
+    if isinstance(device, torch.device):
+        return device
+    return torch.device(device)
+
+
+def move_tree_to_device(x, device, non_blocking=False):
+    """Recursively move tensors inside nested Python containers to `device`."""
+    device = as_torch_device(device)
+    if isinstance(x, torch.Tensor):
+        if x.device != device:
+            x = x.to(device, non_blocking=non_blocking)
+        if is_float8_dtype(x.dtype) and not device_supports_float8(device):
+            x = x.half()
+        return x
+    if isinstance(x, (list, tuple)):
+        return type(x)(move_tree_to_device(item, device, non_blocking) for item in x)
+    if isinstance(x, dict):
+        return {k: move_tree_to_device(v, device, non_blocking) for k, v in x.items()}
+    if is_dataclass(x) and not isinstance(x, type):
+        new_obj = copy.copy(x)
+        for field in fields(x):
+            val = getattr(x, field.name)
+            setattr(new_obj, field.name, move_tree_to_device(val, device, non_blocking))
+        return new_obj
+    if isinstance(x, SimpleNamespace):
+        return SimpleNamespace(**{
+            k: move_tree_to_device(v, device, non_blocking) for k, v in vars(x).items()
+        })
+    return x
+
+
+BLOCK_LIST_NAMES = ('double_blocks', 'single_blocks', 'transformer_blocks', 'layers')
+_PATCH_KEY_PREFIXES = (
+    "diffusion_model.",
+    "model.diffusion_model.",
+    "model.",
+)
+
+
+def resolve_home_device(model_wrapper, target_model, device_names):
+    """Device ComfyUI will load the live model onto.
+
+    After unload_all_models() parameters look like they live on CPU, so we
+    must remember the real home GPU *before* using that as a clone target.
+    Cloning onto the home device puts two full copies on one card and OOMs
+    (e.g. Lumina2 11.7GB x2 on a 24GB GPU).
+    """
+    candidates = []
+    if model_wrapper is not None:
+        candidates.append(getattr(model_wrapper, "load_device", None))
+        inner = getattr(model_wrapper, "model", None)
+        if inner is not None:
+            candidates.append(getattr(inner, "load_device", None))
+    try:
+        candidates.append(next(target_model.parameters()).device)
+    except (StopIteration, AttributeError):
+        pass
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        name = str(candidate)
+        if name != "cpu":
+            return name
+    for name in device_names or ():
+        if name != "cpu":
+            return name
+    if device_names:
+        return device_names[0]
+    return "cpu"
+
+
+def should_reuse_live_model(dev_name, home_device_str):
+    return str(dev_name) == str(home_device_str)
+
+
+def find_model_patcher(model):
+    if model is None:
+        return None
+    if hasattr(model, "patches") and hasattr(model, "add_patches"):
+        return model
+    for attr in ("model_patcher", "patcher"):
+        inner = getattr(model, attr, None)
+        if inner is not None and hasattr(inner, "patches") and hasattr(inner, "add_patches"):
+            return inner
+    return None
+
+
+def collect_weight_patches(model):
+    """Return ModelPatcher.patches without baking them into the live model."""
+    patcher = find_model_patcher(model)
+    if patcher is None:
+        return {}
+    patches = getattr(patcher, "patches", None)
+    return patches if patches else {}
+
+
+def snapshot_weight_patches(patches):
+    """Copy the patch mapping so later disarm/clear cannot empty our bake list."""
+    if not patches:
+        return {}
+    return {key: list(value) for key, value in patches.items()}
+
+
+def disarm_patcher_weight_patches(patcher):
+    """Detach patches so ComfyUI dynamic-VRAM load does not apply LoRA a second time."""
+    if patcher is None or not hasattr(patcher, "patches"):
+        return None
+    saved = patcher.patches
+    if not saved:
+        return None
+    patcher.patches = {}
+    return saved
+
+
+def restore_patcher_weight_patches(patcher, saved):
+    if patcher is None or saved is None:
+        return
+    patcher.patches = saved
+
+
+def bake_lora_with_patcher(patcher, device="cpu"):
+    """Apply LoRA once through ComfyUI's own loader.
+
+    Writing patched values into the live model with param.data.copy_ can
+    segfault on quantized / dynamic-VRAM parameters. patch_model() knows
+    how to handle those tensors.
+    """
+    if patcher is None or not getattr(patcher, "patches", None):
+        return False
+    if not hasattr(patcher, "patch_model"):
+        return False
+    patcher.patch_model(device_to=torch.device(device), force_patch_weights=True)
+    return True
+
+
+def resolve_module_param_key(patch_key, named_params):
+    if patch_key in named_params:
+        return patch_key
+    for prefix in _PATCH_KEY_PREFIXES:
+        if patch_key.startswith(prefix):
+            stripped = patch_key[len(prefix):]
+            if stripped in named_params:
+                return stripped
+    return None
+
+
+def _patch_key_candidates(patch_key):
+    keys = [patch_key]
+    for prefix in _PATCH_KEY_PREFIXES:
+        if patch_key.startswith(prefix):
+            keys.append(patch_key[len(prefix):])
+    return keys
+
+
+def _unwrap_parallel(obj):
+    while isinstance(obj, ParallelBlock):
+        obj = obj.local_block
+    return obj
+
+
+def _lookup_module_tensor(module, dotted_key):
+    obj = module
+    try:
+        for part in dotted_key.split("."):
+            obj = _unwrap_parallel(getattr(_unwrap_parallel(obj), part))
+    except AttributeError:
+        return None
+    obj = _unwrap_parallel(obj)
+    if isinstance(obj, (nn.Parameter, torch.Tensor)):
+        return obj
+    return None
+
+
+def _lookup_module(module, dotted_key):
+    if not dotted_key:
+        return _unwrap_parallel(module)
+    obj = module
+    try:
+        for part in dotted_key.split("."):
+            obj = _unwrap_parallel(getattr(_unwrap_parallel(obj), part))
+    except AttributeError:
+        return None
+    obj = _unwrap_parallel(obj)
+    return obj if isinstance(obj, nn.Module) else None
+
+
+def _module_and_hook_attr(root, tensor_key):
+    for candidate in _patch_key_candidates(tensor_key):
+        if candidate.endswith(".weight"):
+            mod = _lookup_module(root, candidate[: -len(".weight")])
+            if mod is not None:
+                return mod, "weight_function"
+        if candidate.endswith(".bias"):
+            mod = _lookup_module(root, candidate[: -len(".bias")])
+            if mod is not None:
+                return mod, "bias_function"
+    return None, None
+
+
+def copy_lora_cast_hooks(source, replica):
+    """Copy ComfyUI lazy-LoRA hooks that state_dict cloning drops."""
+    if source is None or replica is None or source is replica:
+        return 0
+    src_map = dict(source.named_modules())
+    copied = 0
+    for name, dst in replica.named_modules():
+        src = src_map.get(name)
+        if src is None:
+            continue
+        for attr in ("weight_function", "bias_function"):
+            val = getattr(src, attr, None)
+            if val:
+                setattr(dst, attr, list(val))
+                copied += 1
+        for attr in ("comfy_cast_weights", "comfy_force_cast_weights"):
+            if hasattr(src, attr):
+                setattr(dst, attr, getattr(src, attr))
+    return copied
+
+
+def _attach_lora_hook(module, hook_attr, patch_list, key):
+    def apply_lora(weight):
+        return _calculate_patched_weight(patch_list, weight, key)
+
+    apply_lora._parallel_lora_key = key
+    hooks = list(getattr(module, hook_attr, None) or [])
+    if any(getattr(fn, "_parallel_lora_key", None) == key for fn in hooks):
+        setattr(module, hook_attr, hooks)
+        module.comfy_cast_weights = True
+        return False
+    hooks.append(apply_lora)
+    setattr(module, hook_attr, hooks)
+    module.comfy_cast_weights = True
+    return True
+
+
+def attach_lora_hooks_to_replica(replica, patches):
+    """Install ComfyUI-style weight_function hooks. No matmuls — safe at setup and every step."""
+    if replica is None or not patches:
+        return {"attached": 0, "skipped": 0}
+    attached = 0
+    skipped = 0
+    for key, patch_list in patches.items():
+        mod, hook_attr = _module_and_hook_attr(replica, key)
+        if mod is None:
+            skipped += 1
+            continue
+        if _attach_lora_hook(mod, hook_attr, patch_list, key):
+            attached += 1
+        else:
+            attached += 1
+    return {"attached": attached, "skipped": skipped}
+
+
+def apply_patches_to_replica(replica, patches, progress_label=None):
+    """Bake ModelPatcher.patches into a cloned replica's param.data.
+
+    Must run after incremental clone. Dynamic VRAM often leaves LoRA only in
+    hooks on the live model; state_dict copies are the base checkpoint.
+    Always bake the replica (never the live model). Stay on the replica device.
+    """
+    if replica is None or not patches:
+        return {"baked": 0, "attached": 0, "failed": 0, "skipped": 0}
+    baked = 0
+    attached = 0
+    failed = 0
+    skipped = 0
+    total = len(patches)
+    for index, (key, patch_list) in enumerate(patches.items(), start=1):
+        if progress_label and (index == 1 or index == total or index % 30 == 0):
+            print(f"[ParallelAnything] {progress_label} {index}/{total}", flush=True)
+        param = None
+        for candidate in _patch_key_candidates(key):
+            param = _lookup_module_tensor(replica, candidate)
+            if param is not None:
+                break
+        if param is None:
+            skipped += 1
+            continue
+        try:
+            with torch.no_grad():
+                work = param.detach()
+                if work.dtype != torch.float32:
+                    work = work.float()
+                else:
+                    work = work.clone()
+                patched = _calculate_patched_weight(patch_list, work, key)
+                if not isinstance(patched, torch.Tensor) or patched.shape != param.shape:
+                    raise RuntimeError(
+                        f"bad LoRA result for {key}: {type(patched)} {getattr(patched, 'shape', None)}"
+                    )
+                param.data.copy_(patched.to(device=param.device, dtype=param.dtype))
+            baked += 1
+        except Exception as e:
+            mod, hook_attr = _module_and_hook_attr(replica, key)
+            if mod is not None and (
+                hasattr(mod, "comfy_cast_weights") or hasattr(mod, "weight_function")
+            ):
+                try:
+                    _attach_lora_hook(mod, hook_attr, patch_list, key)
+                    attached += 1
+                    continue
+                except Exception:
+                    pass
+            failed += 1
+            print(f"[ParallelAnything] Warning: could not apply LoRA {key}: {e}")
+    return {"baked": baked, "attached": attached, "failed": failed, "skipped": skipped}
+
+
+def sync_lora_to_replica(source, replica, patches, weights_already_baked=False):
+    """Compatibility wrapper: always bake patches onto the replica."""
+    del source, weights_already_baked
+    return apply_patches_to_replica(replica, patches)
+
+
+def _fallback_calculate_weight(patch_list, weight, key):
+    """Subset of comfy.lora.calculate_weight for tests and simple diff patches."""
+    out = weight
+    for patch in patch_list:
+        if not isinstance(patch, (tuple, list)) or len(patch) < 2:
+            continue
+        strength = patch[0]
+        value = patch[1]
+        strength_model = patch[2] if len(patch) > 2 else 1.0
+        if not isinstance(strength, (int, float)):
+            continue
+        if strength_model != 1.0:
+            out = out * strength_model
+        if hasattr(value, "calculate_weight"):
+            computed = value.calculate_weight(
+                out, key, strength, strength_model, None, lambda a: a, torch.float32, None
+            )
+            if computed is None:
+                raise RuntimeError(f"adapter calculate_weight returned None for {key}")
+            out = computed
+            continue
+        if isinstance(value, torch.Tensor):
+            if value.shape == out.shape:
+                out = out + strength * value.to(device=out.device, dtype=out.dtype)
+            continue
+        if not isinstance(value, (tuple, list)) or len(value) == 0:
+            continue
+        patch_type = "diff"
+        data = value
+        if len(value) == 2 and isinstance(value[0], str):
+            patch_type = value[0]
+            data = value[1]
+        payload = data[0] if isinstance(data, (tuple, list)) else data
+        if not isinstance(payload, torch.Tensor):
+            continue
+        if patch_type == "set":
+            out = payload.to(device=out.device, dtype=out.dtype)
+        elif patch_type == "diff" and payload.shape == out.shape:
+            out = out + strength * payload.to(device=out.device, dtype=out.dtype)
+    return out
+
+
+def _comfy_calculate_weight():
+    try:
+        import comfy.lora as comfy_lora
+        candidate = getattr(comfy_lora, "calculate_weight", None)
+        if callable(candidate) and getattr(candidate, "__module__", "") == "comfy.lora":
+            return candidate
+    except ImportError:
+        pass
+    return None
+
+
+def _calculate_patched_weight(patch_list, weight, key):
+    calc = _comfy_calculate_weight()
+    if calc is not None:
+        return calc(patch_list, weight, key)
+    return _fallback_calculate_weight(patch_list, weight, key)
+
+
+def bake_patches_into_module(module, patches, progress_label=None):
+    """Bake ModelPatcher weight patches onto a module.
+
+    Looks up tensors by key path so we never call named_parameters() on a
+    dynamically staged model (that pages the full 10GB+ checkpoint onto GPU
+    and looks like a hang).
+    """
+    if module is None or not patches:
+        return 0
+    applied = 0
+    total = len(patches)
+    for index, (key, patch_list) in enumerate(patches.items(), start=1):
+        if progress_label and (index == 1 or index == total or index % 20 == 0):
+            print(f"[ParallelAnything] {progress_label} {index}/{total}", flush=True)
+        param = None
+        for candidate in _patch_key_candidates(key):
+            param = _lookup_module_tensor(module, candidate)
+            if param is not None:
+                break
+        if param is None:
+            continue
+        try:
+            with torch.no_grad():
+                work_dtype = torch.float32 if param.dtype != torch.float32 else param.dtype
+                base = param.detach()
+                if base.device.type != "cpu" or base.dtype != work_dtype:
+                    base = base.to(device="cpu", dtype=work_dtype)
+                else:
+                    base = base.clone()
+                patched = _calculate_patched_weight(patch_list, base, key)
+                if not isinstance(patched, torch.Tensor):
+                    raise RuntimeError(f"calculate_weight returned {type(patched).__name__}")
+                if patched.shape != param.data.shape:
+                    print(
+                        f"[ParallelAnything] Warning: LoRA shape mismatch for {key}: "
+                        f"{tuple(patched.shape)} != {tuple(param.data.shape)}"
+                    )
+                    continue
+                param.data.copy_(patched.to(device=param.device, dtype=param.dtype))
+            applied += 1
+        except Exception as e:
+            print(f"[ParallelAnything] Warning: failed to bake LoRA patch {key}: {e}")
+    if applied:
+        print(f"[ParallelAnything] Baked {applied} LoRA/weight patches into replica", flush=True)
+    elif patches:
+        print(f"[ParallelAnything] Warning: {len(patches)} patches found but none matched replica keys", flush=True)
+    return applied
+
+
+def unwrap_parallel_blocks(module):
+    """Replace ParallelBlock wrappers with the original lead-model blocks.
+
+    Re-running setup without this nests wrappers and leaves stale peer
+    references that point at deleted replicas.
+    """
+    if module is None or isinstance(module, ParallelBlock):
+        return
+    for list_name in BLOCK_LIST_NAMES:
+        block_list = getattr(module, list_name, None)
+        if not isinstance(block_list, nn.ModuleList):
+            continue
+        for idx, block in enumerate(block_list):
+            current = block
+            while isinstance(current, ParallelBlock):
+                current = current.local_block
+            if current is not block:
+                block_list[idx] = current
+    for child in module.children():
+        unwrap_parallel_blocks(child)
+
+
 class ParallelBlock(nn.Module):
     """
     A wrapper that handles dual-mode execution:
@@ -31,30 +478,32 @@ class ParallelBlock(nn.Module):
         super().__init__()
         self.local_block = local_block
         self.block_idx = block_idx
-        self.owner_device = owner_device
-        self.peers = peers
+        self.owner_device = as_torch_device(owner_device)
         self.is_last_block = is_last_block
-        self.lead_device = lead_device
-        self.owner_block = self.peers.get(str(owner_device), local_block)
+        self.lead_device = as_torch_device(lead_device)
+        # Peer replica modules must NOT be registered as children.
+        # ComfyUI later does model.to(lead_device); if owner_block is a
+        # submodule, that silently moves cuda:1 weights onto cuda:0 and
+        # produces wrapper_CUDA_addmm device mismatches.
+        owner_key = str(self.owner_device)
+        if owner_key in peers:
+            owner_block = peers[owner_key]
+        elif self.owner_device == self.lead_device:
+            owner_block = local_block
+        else:
+            raise RuntimeError(
+                f"[ParallelAnything] ParallelBlock {block_idx}: no peer for {owner_key}; "
+                f"have {list(peers)}"
+            )
+        object.__setattr__(self, "peers", peers)
+        object.__setattr__(self, "_owner_block_holder", [owner_block])
+
+    @property
+    def owner_block(self):
+        return self._owner_block_holder[0]
 
     def _move_tensor(self, x, device):
-        """Recursively move tensors, lists, tuples, dicts, and dataclasses to target device."""
-        if isinstance(x, torch.Tensor):
-            if x.device != device:
-                return x.to(device, non_blocking=True)
-            return x
-        elif isinstance(x, (list, tuple)):
-            return type(x)(self._move_tensor(item, device) for item in x)
-        elif isinstance(x, dict):
-            return {k: self._move_tensor(v, device) for k, v in x.items()}
-        elif is_dataclass(x):
-            # Shallow copy dataclass and move its tensor fields
-            new_obj = copy.copy(x)
-            for field in fields(x):
-                val = getattr(x, field.name)
-                setattr(new_obj, field.name, self._move_tensor(val, device))
-            return new_obj
-        return x
+        return move_tree_to_device(x, device, non_blocking=True)
 
     def _move_args(self, args, device):
         return tuple(self._move_tensor(a, device) for a in args)
@@ -220,6 +669,27 @@ def cleanup_parallel_model(model_ref):
     should_purge_cache = getattr(model, '_parallel_purge_cache', True)
     should_purge_models = getattr(model, '_parallel_purge_models', False)
     
+    saved_patches = getattr(model, '_parallel_saved_patches', None)
+    if saved_patches:
+        try:
+            patcher = saved_patches[0]
+            patches = saved_patches[1]
+            backup = saved_patches[2] if len(saved_patches) > 2 else None
+            if backup is not None and hasattr(patcher, "backup"):
+                patcher.backup = backup
+                if hasattr(patcher, "unpatch_model"):
+                    try:
+                        patcher.unpatch_model(unpatch_weights=True)
+                    except Exception:
+                        pass
+            restore_patcher_weight_patches(patcher, patches)
+        except Exception as e:
+            print(f"[ParallelAnything] Warning: Could not restore LoRA patches: {e}")
+        try:
+            delattr(model, '_parallel_saved_patches')
+        except Exception:
+            pass
+
     # Restore original forward
     if hasattr(model, '_original_forward'):
         try:
@@ -227,13 +697,21 @@ def cleanup_parallel_model(model_ref):
             delattr(model, '_original_forward')
         except Exception:
             pass
+
+    # Drop pipeline wrappers before replicas go away so a later setup
+    # does not nest ParallelBlocks around stale peer references.
+    try:
+        unwrap_parallel_blocks(model)
+    except Exception as e:
+        print(f"[ParallelAnything] Warning: Could not unwrap parallel blocks: {e}")
     
     # Cleanup replicas
     if hasattr(model, '_parallel_replicas'):
         replicas = model._parallel_replicas
         for dev_name, replica in list(replicas.items()):
             try:
-                if hasattr(replica, 'cpu'):
+                unwrap_parallel_blocks(replica)
+                if replica is not model and hasattr(replica, 'cpu'):
                     replica.cpu()
                 clear_flux_caches(replica)
                 if hasattr(replica, 'gradient_checkpointing'):
@@ -293,6 +771,7 @@ def extract_model_config(model):
         'adm_in_channels', 'num_noises', 'context_dim', 'n_heads', 'd_head',
         'transformer_depth', 'model_channels', 'max_depth', 'num_frames',
         'temporal_compression', 'temporal_dim', 'video_length',
+        'operations', 'ops',
     ]
     
     for attr in possible_attrs:
@@ -338,8 +817,18 @@ def extract_model_config(model):
     if hasattr(model, 'unet_config') and isinstance(model.unet_config, dict):
         config.update({k: v for k, v in model.unet_config.items() if not isinstance(v, (torch.Tensor, nn.Module))})
     
+    # ComfyUI models (Lumina2/Flux) need the ops factory. Dropping it makes
+    # model_class(**config) do None.Linear and fall back to the slow recursive clone.
+    for attr in ("operations", "ops"):
+        if hasattr(model, attr):
+            config[attr] = getattr(model, attr)
+
     clean_config = {}
+    keep_refs = {"operations", "ops"}
     for k, v in config.items():
+        if k in keep_refs:
+            clean_config[k] = v
+            continue
         if v is not None and not isinstance(v, (torch.Tensor, nn.Module)):
             try:
                 copy.deepcopy(v)
@@ -930,24 +1419,19 @@ class ParallelAnything:
             model_wrapper = None
 
         # CRITICAL FIX: Check if model is stranded on CPU BEFORE determining original_device
-        # This happens when previous run moved it to CPU for safe cloning but didn't restore it
         try:
             current_device = next(target_model.parameters()).device
             if current_device.type == 'cpu':
-                # Check if ComfyUI expects it elsewhere (load_device hint)
                 expected_device = None
                 if hasattr(model, 'load_device'):
                     expected_device = model.load_device
                 elif hasattr(model, 'model') and hasattr(model.model, 'load_device'):
                     expected_device = model.model.load_device
-                
-                # If we have a hint that it should be on CUDA, restore it
                 if expected_device is not None and expected_device.type == 'cuda':
                     print(f"[ParallelAnything] Restoring stranded model from CPU to {expected_device}")
                     target_model = target_model.to(str(expected_device))
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
-                # Also check model_management's current device
                 else:
                     mgmt_device = comfy.model_management.get_torch_device()
                     if mgmt_device.type == 'cuda':
@@ -960,7 +1444,6 @@ class ParallelAnything:
         except Exception as e:
             print(f"[ParallelAnything] Warning during CPU restoration: {e}")
 
-        # NOW determine original device after potential restoration
         try:
             original_device = next(target_model.parameters()).device
             original_device_str = str(original_device)
@@ -968,40 +1451,32 @@ class ParallelAnything:
             original_device = torch.device('cpu')
             original_device_str = "cpu"
 
-        # Check if ComfyUI model has patches (LoRAs) that need to be applied
-        has_lora_patches = False
-        patches_location = None
-        
-        if model_wrapper is not None:
-            # Check various locations where ComfyUI might store patches
-            locations = [
-                ('patches', lambda m: m.patches),
-                ('model_patcher.patches', lambda m: m.model_patcher.patches if hasattr(m, 'model_patcher') else None),
-                ('model_patcher.patches_dict', lambda m: m.model_patcher.patches_dict if hasattr(m, 'model_patcher') else None),
-            ]
-            for name, getter in locations:
-                try:
-                    val = getter(model_wrapper)
-                    if val and len(val) > 0:
-                        has_lora_patches = True
-                        patches_location = name
-                        print(f"[ParallelAnything] Found {len(val)} patches in {name}")
-                except Exception:
-                    pass
-
-        # Apply patches if found
+        # Original LoRA path: patch_model, then clone. Incremental clone only
+        # copies state_dict, so we also sync weight_function hooks afterward.
+        patch_source = model_wrapper if model_wrapper is not None else model
+        weight_patches = snapshot_weight_patches(collect_weight_patches(patch_source))
+        has_lora_patches = bool(weight_patches)
+        lora_weights_baked = False
         if has_lora_patches:
+            print(f"[ParallelAnything] Found {len(weight_patches)} LoRA/weight patches")
             try:
                 print("[ParallelAnything] Applying LoRA/Custom patches before cloning...")
                 if hasattr(model_wrapper, 'patch_model'):
-                    model_wrapper.patch_model(device_to=comfy.model_management.get_torch_device())
+                    model_wrapper.patch_model(
+                        device_to=comfy.model_management.get_torch_device(),
+                        force_patch_weights=True,
+                    )
                     print("[ParallelAnything] Patches applied successfully")
                 elif hasattr(model_wrapper, 'model_patcher') and hasattr(model_wrapper.model_patcher, 'patch_model'):
-                    model_wrapper.model_patcher.patch_model(device_to=comfy.model_management.get_torch_device())
+                    model_wrapper.model_patcher.patch_model(
+                        device_to=comfy.model_management.get_torch_device(),
+                        force_patch_weights=True,
+                    )
                     print("[ParallelAnything] Patches applied via model_patcher")
+                patcher = find_model_patcher(patch_source)
+                lora_weights_baked = bool(getattr(patcher, "backup", None))
             except Exception as e:
                 print(f"[ParallelAnything] Warning: Could not apply patches: {e}")
-                has_lora_patches = False
 
         # Cleanup previous parallel setup if exists
         if hasattr(target_model, "_true_parallel_active"):
@@ -1011,9 +1486,9 @@ class ParallelAnything:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 comfy.model_management.soft_empty_cache()
-        
-        print("[ParallelAnything] Freeing ComfyUI model cache for cloning...")
-        comfy.model_management.unload_all_models()
+
+        # Do not unload_all_models() here: that unbakes LoRA on current ComfyUI.
+        # Original principle is patch_model then clone the baked weights.
         aggressive_cleanup()
         
         total_pct = sum(item["percentage"] for item in device_chain)
@@ -1067,11 +1542,10 @@ class ParallelAnything:
                 dev = torch.device(dev_name)
                 need_safe = dev_name in devices_needing_safe_attention
                 
-                # Determine if this is the original device
                 is_original_device = (dev_name == original_device_str and not needs_cpu_transition)
                 
-                # CRITICAL FIX: If we have LoRA patches, we MUST clone even the original device
-                # because ComfyUI will manage the original model's weights separately
+                # Original rule: with LoRA, clone every device including home
+                # so each replica has independent baked weights.
                 if is_original_device and not has_lora_patches:
                     print(f"[ParallelAnything] Using original model for {dev_name} (skipping clone)")
                     replicas[dev_name] = target_model
@@ -1127,7 +1601,6 @@ class ParallelAnything:
                 total_weight = sum(successful_weights)
                 weights = [w/total_weight for w in successful_weights]
             
-            # Restore original to its device if we moved it to CPU and it's not in our replicas
             if needs_cpu_transition and original_device_str not in replicas:
                 try:
                     print(f"[ParallelAnything] Restoring original model to {original_device}")
@@ -1152,9 +1625,19 @@ class ParallelAnything:
         print("[ParallelAnything] Configuring Model/Pipeline Parallelism for Batch=1...")
         lead_device_name = device_names[0]
         lead_replica = replicas[lead_device_name]
+        unwrap_parallel_blocks(lead_replica)
+
+        # Never wrap the live ComfyUI model. Wrapping hides Linear keys from
+        # ModelPatcher and our hooks fight dynamic-VRAM/sage (blurry "paint"
+        # images on the 70% home split).
+        wrap_lead = lead_replica is not target_model
+        if not wrap_lead:
+            print("[ParallelAnything] Skipping pipeline wrap on live home model (keeps ComfyUI LoRA/sage)")
         
-        block_lists = ['double_blocks', 'single_blocks', 'transformer_blocks', 'layers']
+        block_lists = list(BLOCK_LIST_NAMES)
         for list_name in block_lists:
+            if not wrap_lead:
+                break
             if hasattr(lead_replica, list_name):
                 local_blocks = getattr(lead_replica, list_name)
                 if not isinstance(local_blocks, nn.ModuleList):
@@ -1197,6 +1680,33 @@ class ParallelAnything:
                     )
                     local_blocks[idx] = wrapper
         
+        # Clones only: bake LoRA into param.data. Hooks do not run on many
+        # cloned Linears, which is why the 30% V100 split had no LoRA while
+        # the live 3090 (ComfyUI path) did. Never bake the live model.
+        if has_lora_patches:
+            seen = set()
+            for dev_name, replica in replicas.items():
+                if replica is target_model or id(replica) in seen:
+                    if replica is target_model:
+                        print(f"[ParallelAnything] {dev_name} is live model; ComfyUI applies LoRA")
+                    continue
+                seen.add(id(replica))
+                print(f"[ParallelAnything] Baking LoRA into clone on {dev_name}...", flush=True)
+                baked = apply_patches_to_replica(
+                    replica, weight_patches, progress_label=f"{dev_name} LoRA"
+                )
+                print(
+                    f"[ParallelAnything] LoRA on {dev_name}: "
+                    f"baked={baked['baked']} attached={baked['attached']} "
+                    f"failed={baked['failed']} skipped={baked['skipped']}",
+                    flush=True,
+                )
+                if baked["baked"] + baked["attached"] == 0:
+                    raise RuntimeError(
+                        f"LoRA patches were found ({len(weight_patches)}) but none "
+                        f"applied on clone {dev_name}."
+                    )
+
         target_model._parallel_purge_cache = purge_cache
         target_model._parallel_purge_models = purge_models
         
@@ -1237,17 +1747,7 @@ class ParallelAnything:
                 return [x] * len(split_sizes)
         
         def move_to_device(x, device, non_blocking=False):
-            if isinstance(x, torch.Tensor):
-                if x.device != torch.device(device):
-                    x = x.to(device, non_blocking=non_blocking)
-                if is_float8_dtype(x.dtype) and not device_supports_float8(device):
-                    x = x.half()
-                return x
-            elif isinstance(x, (list, tuple)):
-                moved = [move_to_device(t, device, non_blocking) for t in x]
-                return type(x)(moved)
-            else:
-                return x
+            return move_tree_to_device(x, device, non_blocking=non_blocking)
         
         def split_kwargs(kwargs, split_sizes, total_batch):
             split_kwargs_list = [{} for _ in range(len(split_sizes))]
@@ -1435,15 +1935,24 @@ class ParallelAnything:
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
                     print("[ParallelAnything] OOM in parallel forward, attempting emergency cleanup...")
+                    lead_name = devices_ref[0]
+                    lead_replica = replicas_ref[lead_name]
+                    for name, replica in list(replicas_ref.items()):
+                        if replica is lead_replica:
+                            continue
+                        try:
+                            if hasattr(replica, "cpu"):
+                                replica.cpu()
+                        except Exception:
+                            pass
                     aggressive_cleanup()
                     print("[ParallelAnything] Falling back to single device processing...")
                     set_pipeline_mode(False)
                     with torch.no_grad():
-                        first_replica = replicas_ref[devices_ref[0]]
-                        if hasattr(first_replica, '_original_forward'):
-                            return first_replica._original_forward(x, timesteps, context=context, **kwargs)
+                        if hasattr(lead_replica, '_original_forward'):
+                            return lead_replica._original_forward(x, timesteps, context=context, **kwargs)
                         else:
-                            return first_replica(x, timesteps, context=context, **kwargs)
+                            return lead_replica(x, timesteps, context=context, **kwargs)
                 else:
                     raise
         

@@ -160,11 +160,13 @@ Place Parallel Anything immediately before the KSampler, after all LoRA/weight m
 Load Checkpoint → Load LoRA → [Parallel Anything] → KSampler
 ```
 
+LoRA is baked onto each GPU replica from `ModelPatcher.patches`. Do not put Parallel Anything *before* the LoRA loader — replicas would miss the adapters.
+
 ---
 
 ## ⚠️ Important Considerations
 
-* **VRAM Usage**: This node uses **Model Replication**. If you use 2 GPUs, you will use 2 times the VRAM (one copy per card).
+* **VRAM Usage**: This node uses **Model Replication**. Each *extra* GPU holds a full copy. The ComfyUI home GPU (usually `cuda:0`) reuses the live model so a 12GB Lumina2/FLUX does not get cloned twice onto a 24GB card.
 * **Batch Size**: Parallelism only triggers if your **Batch Size** is > the number of devices in your chain.
 * **Inference Tensors**: The node automatically clones and detaches tensors to bypass PyTorch's "Inference tensors do not track version counter" error common in multi-GPU workflows.
 
@@ -175,8 +177,7 @@ Load Checkpoint → Load LoRA → [Parallel Anything] → KSampler
 If you encounter a **RuntimeError** regarding "Inference Tensors":
 * Ensure you are using a **Batch Size** large enough to split.
 * The node uses a "Deep Detach" strategy (`.detach().clone()`) to satisfy the version counter requirements of the KSampler.
-* if you see the message "RuntimeError: Expected all tensors to be on the same device, but got mat1 is on cuda:0, different from other tensors on cuda:1 (when checking argument in method wrapper_CUDA_addmm)
-" after changing the percentage of the GPU'S for the second run. restart comfyui or add **--cache-none** in the ComfyUI startup arguments
+* If you see `RuntimeError: Expected all tensors to be on the same device` (`mat1` on `cuda:1`, weights on `cuda:0`), update this node. Older builds registered replica blocks as PyTorch submodules, so ComfyUI's `model.to(cuda:0)` silently moved the other GPU's weights. A restart or `--cache-none` is no longer required for that case.
 
 ### Slower than single GPU
 #### Common causes:
